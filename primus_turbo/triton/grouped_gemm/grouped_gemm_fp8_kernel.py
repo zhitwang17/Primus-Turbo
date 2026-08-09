@@ -1,8 +1,5 @@
-###############################################################################
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-#
 # See LICENSE for license information.
-###############################################################################
 
 """
 Grouped FP8 GEMM Triton persistent kernels (CPU-sync-free).
@@ -323,16 +320,38 @@ def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
 
 
 # ###########################################################################
-#
 #  PART 1 — TENSORWISE (per-tensor) FP8 Grouped GEMM
-#
 # ###########################################################################
+
+
+@triton.jit()
+def _compute_tile_cumsum_kernel(
+    group_offs_ptr,  # [G+1] int64
+    tile_cumsum_ptr,  # [G+1] int32 (output)
+    G,  # runtime number of groups
+    num_pid_n,  # runtime int = cdiv(N, BLOCK_SIZE_N)
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """Single-program kernel; precomputes per-group cumulative tile counts."""
+    cumsum: tl.int32 = 0
+    tl.store(tile_cumsum_ptr, 0)
+    for g in range(G):
+        m_g = (tl.load(group_offs_ptr + g + 1) - tl.load(group_offs_ptr + g)).to(tl.int32)
+        tiles_g = tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+        cumsum += tiles_g
+        tl.store(tile_cumsum_ptr + g + 1, cumsum)
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power-of-two >= max(n, 1) (Triton tl.arange requires power-of-two)."""
+    p = 1
+    while p < max(n, 1):
+        p <<= 1
+    return p
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tensorwise FP8 Forward Kernel (persistent, CPU-sync-free)
-#
-# Computes: out[offs[g]:offs[g+1], :] = A[offs[g]:offs[g+1], :] @ B_view[g] * a_scale * b_scale
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -345,6 +364,7 @@ def _grouped_fp8_persistent_gemm_kernel(
     A_scale_ptr,  # per-tensor scale for A (scalar, fp32)
     B_scale_ptr,  # per-tensor scale for B (scalar, fp32)
     group_offs_ptr,  # [G+1] int64
+    tile_cumsum_ptr,  # [G+1] int32 (precomputed cumulative tile counts)
     # Dimensions
     G,  # number of groups (runtime)
     N,
@@ -369,6 +389,7 @@ def _grouped_fp8_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    MAX_G_NEXT_POW2: tl.constexpr,  # smallest pow2 >= G+1 (for tl.arange load)
 ):
     """Persistent grouped FP8 GEMM kernel (CPU-sync-free, per-tensor scaling)."""
     pid = tl.program_id(0)
@@ -377,11 +398,14 @@ def _grouped_fp8_persistent_gemm_kernel(
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    # ── Compute total tiles across all groups ──
-    total_tiles: tl.int32 = 0
-    for _g in range(G):
-        m_g = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-        total_tiles += tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+    g_idx_arr = tl.arange(0, MAX_G_NEXT_POW2)
+    g_valid_mask = g_idx_arr <= G  # valid range is [0..G]
+    tile_cumsum_arr = tl.load(
+        tile_cumsum_ptr + g_idx_arr,
+        mask=g_valid_mask,
+        other=2147483647,  # sentinel: out-of-range groups never win the <= compare
+    ).to(tl.int32)
+    total_tiles = tl.load(tile_cumsum_ptr + G).to(tl.int32)
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -398,18 +422,9 @@ def _grouped_fp8_persistent_gemm_kernel(
     acc_dtype = tl.float32
 
     for global_tile_id in range(pid, total_tiles, NUM_SMS):
-        # ── Find group via linear scan (O(G)) ──
-        group_idx: tl.int32 = 0
-        tile_start: tl.int32 = 0
-        cumsum: tl.int32 = 0
-        for _g in range(G):
-            m_g_i = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-            tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
-            new_cumsum = cumsum + tiles_g
-            if global_tile_id >= new_cumsum:
-                group_idx = _g + 1
-                tile_start = new_cumsum
-            cumsum = new_cumsum
+        le_mask = (tile_cumsum_arr <= global_tile_id) & (g_idx_arr >= 1) & (g_idx_arr <= G)
+        group_idx = tl.sum(le_mask.to(tl.int32))
+        tile_start = tl.sum(tl.where(g_idx_arr == group_idx, tile_cumsum_arr, 0))
 
         # ── Group-local tile → (pid_m, pid_n) with GROUP_SIZE_M swizzle ──
         local_tile = global_tile_id - tile_start
@@ -561,6 +576,17 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     )
     even_k = K % blk_k == 0
 
+    num_pid_n_int = (N + blk_n - 1) // blk_n
+    tile_cumsum = torch.empty(G + 1, device=a.device, dtype=torch.int32)  # device cumsum, no host sync
+    _compute_tile_cumsum_kernel[(1,)](
+        group_offs,
+        tile_cumsum,
+        G,
+        num_pid_n_int,
+        BLOCK_SIZE_M=blk_m,
+    )
+    max_g_next_pow2 = _next_pow2(G + 1)
+
     _grouped_fp8_persistent_gemm_kernel[(num_sms,)](
         a,
         b,
@@ -568,6 +594,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         a_scale,
         b_scale,
         group_offs,
+        tile_cumsum,
         G,
         N,
         K,
@@ -588,6 +615,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        MAX_G_NEXT_POW2=max_g_next_pow2,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -676,18 +704,12 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
 
 
 # ###########################################################################
-#
 #  PART 1.5 — ROWWISE (per-row / per-col vector) FP8 Grouped GEMM
-#
 # ###########################################################################
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rowwise FP8 Forward Kernel (persistent, CPU-sync-free)
-#
-# Identical to the tensorwise forward except scale application:
-#   a_scale: (M_total,) fp32 — per output-row (indexed by absolute row)
-#   b_scale: (G, N)    fp32 — per output-col per group
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -950,9 +972,6 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rowwise FP8 Variable-K Backward Kernel
-#
-# C[g] = LHS_g^T @ RHS_g  with vector scaling:
-#   lhs_scale: (OUT_M,) fp32, rhs_scale: (OUT_N,) fp32
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -1176,27 +1195,18 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
 
 
 # ###########################################################################
-#
 #  PART 2 — BLOCKWISE FP8 Grouped GEMM
-#
 # ###########################################################################
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Blockwise FP8 Forward Kernel (persistent, CPU-sync-free)
-#
-# Computes: out[offs[g]:offs[g+1], :] = A[offs[g]:offs[g+1], :] @ B_view[g]
-#   with block-wise scaling: A_scales[M, K//128], B_scales[G, n_blocks, k_blocks]
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-# 8-config curated set covering small/medium/large M and N-major/M-major reductions.
-# All BK=128 (winners). Trimmed from a 32-config sweep that always picked one of these.
 def _get_grouped_blockwise_autotune_configs():
     # BLOCK_SIZE_N pinned to 128: the persistent kernel loads ONE b_scale per
-    # tile (assumes BN == SCALE_BLOCK_N == 128). With BN=256 the kernel applies
-    # the wrong scale to half the output cols → ~10dB SNR drop. There's also a
-    # known MI300X MFMA layout bug on FP8 e4m3fnuz with BN=64/256.
+    # tile (assumes BN == SCALE_BLOCK_N == 128), so wider BN scales half the cols wrong.
     return [
         # small/medium fallback
         triton.Config(
@@ -1294,7 +1304,6 @@ def _get_grouped_blockwise_autotune_configs():
 # Single persistent kernel for both K-aligned (EVEN_K) and K-unaligned (masked
 # tail) blockwise FP8. BLOCK_N pinned to 128 (BN=64/256 hit an MFMA layout bug on
 # MI300X FP8 e4m3fnuz); BLOCK_M=256 must use BLOCK_K=128 (same bug).
-# BLOCK_M=256 must use BLOCK_K=128 (same bug otherwise).
 @triton.autotune(configs=_get_grouped_blockwise_autotune_configs(), key=["G", "N", "K"])
 @triton.jit()
 def _grouped_blockwise_fp8_persistent_gemm_kernel(
@@ -1344,7 +1353,6 @@ def _grouped_blockwise_fp8_persistent_gemm_kernel(
     # Vectorise the per-group cumsum so the per-tile group lookup is a single
     # masked compare+reduce instead of an O(G) carry-dependent scan. tl.arange
     # needs a power-of-2 bound, so pad to G_POW2 and mask the tail to 0 tiles
-    # (padded groups contribute nothing to cumsum / group_idx selection).
     g_arange = tl.arange(0, G_POW2)
     g_valid = g_arange < G
     g_starts = tl.load(group_offs_ptr + g_arange, mask=g_valid, other=0)
@@ -1748,13 +1756,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     num_sms = get_num_cus()
 
     aligned = K % 128 == 0
-    # First call for this (G, N, K, aligned) shape: prime autotune with a balanced
-    # group_offs distribution. Triton's autotune key is (G, N, K) only — group_lens
-    # is not part of the key, so whichever distribution happens to drive the first
-    # call gets baked into the cached config. In MoE training, per-step routing is
-    # uneven and varies, so without this warm-up we'd cache a config tuned to one
-    # accidental imbalance. Run a synthetic balanced-offs trial into a scratch out
-    # so the chosen config generalizes across the lifetime of the process.
+    # Warm autotune with balanced offs: the key omits group_offs, else the first call bakes a skewed config.
     if (G, N, K, aligned) not in _grouped_blockwise_warmed:
         _grouped_blockwise_warmed.add((G, N, K, aligned))
         per = M_total // G
@@ -1896,10 +1898,6 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     stride_lhs_n = lhs.stride(0) if a_k_contig else lhs.stride(1)
     stride_rhs_n = rhs.stride(0) if b_k_contig else rhs.stride(1)
 
-    # Same balanced-warmup logic as the fwd kernel: autotune key is
-    # (G, OUT_M, OUT_N, A_K_CONTIGUOUS, B_K_CONTIGUOUS) — group_offs is not part
-    # of the key, so prime the cache once with a balanced distribution so the
-    # chosen config generalizes across MoE per-step routing variation.
     warm_key = (G, OUT_M, OUT_N, a_k_contig, b_k_contig)
     if warm_key not in _grouped_blockwise_vk_warmed:
         _grouped_blockwise_vk_warmed.add(warm_key)
@@ -1975,18 +1973,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
 
 
 # ###########################################################################
-#
 #  PART 3 — MXFP8 (MX_BLOCKWISE) Grouped GEMM
-#
-#  Persistent grouped MXFP8 kernels (gfx950) mirroring the blockwise kernels'
-#  scheduling, but the inner K-loop uses hardware block-scaled MMA via
-#  tl.dot_scaled with E8M0 (VEC_SIZE=32) scales (e4m3 / e5m2 elements). Scales
-#  are stored transposed (K/32, M) / (G, K/32, N) for a coalesced per-K-iter
-#  load, transposed back in-reg for tl.dot_scaled.
-#
-#    forward (NT):   C[g] = A[g] @ B[g]^T
-#    variable-K wgrad: C[g] = LHS[g] @ RHS[g]^T, reduction over the padded M_g
-#
 # ###########################################################################
 
 
@@ -2225,10 +2212,6 @@ def grouped_gemm_mxfp8_triton_kernel(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Variable-K backward (wgrad): C[g] = LHS[g] @ RHS[g]^T, reduction over M_g (dim1)
-#   LHS = grad_out_col (OUT_M=N, M_total) e4m3, LHS_scale (N, M_total//32) u8
-#   RHS = a_col        (OUT_N=K, M_total) e4m3, RHS_scale (K, M_total//32) u8
-#   C   = (G, N, K)
-#   go_pad: padded per-group offsets along M (each M_g a multiple of 128 → no mask)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -2347,9 +2330,6 @@ def grouped_gemm_mxfp8_variable_k_triton_kernel(
     lhs_fmt = "e5m2" if lhs.dtype == torch.float8_e5m2 else "e4m3"
     rhs_fmt = "e5m2" if rhs.dtype == torch.float8_e5m2 else "e4m3"
     cu = num_cu if num_cu is not None else torch.cuda.get_device_properties(lhs.device).multi_processor_count
-    # Asymmetric 256x128 tile: with the R operand loaded directly as (BK,BN)
-    # (no in-reg transpose) the VGPR budget fits 256x128, matching the
-    # tensorwise variable_k throughput (~3.7x over the old 128x128 + r.T).
     BM, BN, BK = 256, 128, 128
     tiles_m = (OUT_M + BM - 1) // BM
     tiles_n = (OUT_N + BN - 1) // BN
