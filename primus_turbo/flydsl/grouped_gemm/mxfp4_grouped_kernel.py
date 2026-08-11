@@ -493,9 +493,11 @@ def _build_grouped_mxfp4_nt_kernel(
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
 _GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw_launch, compiled]
-# tile-blocking: NT=(group_m,num_xcds,group_n,xcd_span) band-cyclic; wgrad=first three, xcd=1
+# tile-blocking: NT=(group_m,num_xcds,group_n,xcd_span), wgrad=(group_m,num_xcds,group_n)
 _GMXFP4_NT_CFG = (4, 8, 0, 16)
 _GMXFP4_WGRAD_CFG = (2, 1, 4)
+_GMXFP4_WGRAD_CFG_SHORT = (4, 8, 0)  # short per-group contraction: see the selector below
+_GMXFP4_WGRAD_SHORT_MG = 8192  # per-group contraction at/below which the short-M blocking applies
 _GMXFP4_CACHE_CAP = 32  # drop caches past this; real MoE uses few shapes, a test sweep many
 
 
@@ -901,10 +903,30 @@ def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
     return e
 
 
+def _select_gmxfp4_wgrad_cfg(M_total, G):
+    """Pick the wgrad tile blocking from the mean per-group contraction (host-side shapes only,
+    no D2H and no group_offs inspection). The output is [G, OUT_M, OUT_N], so a short per-group
+    contraction writes G x more C bytes for the same FLOP and the store saturates the mixed DRAM
+    rate; the only way to feed it is to read less. A short contraction also shrinks an operand
+    slab enough that the XCD de-interleave keeps each XCD's slabs L2-resident, which is what cuts
+    those reads -- at a long per-group contraction the same slab is several times the L2 slice,
+    so that regime keeps the narrow band and the identity tile map."""
+    return _GMXFP4_WGRAD_CFG_SHORT if M_total // max(G, 1) <= _GMXFP4_WGRAD_SHORT_MG else _GMXFP4_WGRAD_CFG
+
+
 def _compile_grouped_mxfp4_wgrad_fused(OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16):
     K128m = M_total // 128
     gemm_k, attrs, TOTAL, b_ilv = _build_grouped_mxfp4_wgrad_kernel(
-        OUT_M, OUT_N, G, M_total, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16
+        OUT_M,
+        OUT_N,
+        G,
+        M_total,
+        group_m=gm,
+        num_xcds=xcd,
+        group_n=gn,
+        wlv=wlv,
+        elgk=elgk,
+        out_fp16=out_fp16,
     )
     pre_ab = _build_mxfp4_preshuffle_kernel_ab(b_ilv=b_ilv)  # b_ilv: rhs scale follows rhs row map
     _PGRID = _MXFP4_PRESHUF_FO * _MXFP4_PRESHUF_BLK
@@ -977,9 +999,7 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
         lk = (OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16)
         ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
         if ent is None:
-            ent = _compile_grouped_mxfp4_wgrad_fused(
-                OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16
-            )
+            ent = _compile_grouped_mxfp4_wgrad_fused(OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16)
             _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
         atk = (OUT_M, OUT_N, M_total, G, gm, xcd, gn, out_fp16)
         e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
@@ -988,6 +1008,6 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             _GMXFP4_WGRAD_AT_CACHE[atk] = e2
         return e2
 
-    run_eager_or_capture(_entry(_GMXFP4_WGRAD_CFG), args, 1)
+    run_eager_or_capture(_entry(_select_gmxfp4_wgrad_cfg(M_total, G)), args, 1)
     _bound_caches(_GMXFP4_WGRAD_LAUNCH_CACHE, _GMXFP4_WGRAD_AT_CACHE, _GMXFP4_WGRAD_WS_CACHE)
     return out
