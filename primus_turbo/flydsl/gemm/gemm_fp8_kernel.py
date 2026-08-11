@@ -17,6 +17,7 @@ mfma_f32_16x16x128_f8f6f4, per-tensor scale, bf16/fp16 out, arbitrary K (TT unsu
 NT/NN and the TN fallback are 8-wave; TN's primary path is the 4-wave whole-loop."""
 
 import functools
+import math
 
 import torch
 
@@ -1056,20 +1057,66 @@ _TN4_PIN = 8  # first VGPR of the pinned operand-fragment window
 _TN4_ELGK = 12
 _TN4_AGPR = 64  # vector<4xf32> accumulators the AGPR file holds; any beyond it take VGPRs
 _TN4_RED_VEC = 8  # out_ty elements one lane folds per load (a b128 request)
-_TN4_RED_WPT = 4  # reduce workgroups per split-K window tile
+_TN4_RED_WPT = 8  # reduce workgroups per split-K window tile
+_TN4_HAND_S = 2  # split-K slices the in-register handoff covers
+# sc0|sc1: the handed-over partial and its flag are published at device scope, since nothing
+# pins a tile's two slices to one XCD's L2. Its requests are a full 128B line wide, so the
+# scope costs the round trip and not a per-line penalty.
+_TN4_HAND_AUX = 17
+# One wait state emitted between the body's instruction groups; see _tn4_pad.
+_TN4_ISSUE_PAD = "s_nop 0"
+# Body boundaries that take one, named "<kind before><kind after>" over the group kinds
+# m (mfma), d (ds_read refill), g (global->LDS write); "d" / "g" alone space a group's own
+# instructions instead of its trailing boundary.
+_TN4_PAD_ALL = ("mm", "md", "mg", "dm", "dd", "dg", "gm", "gd", "gg")
 _TN4_ASM_CACHE: dict = {}
 
-# Macro-tile geometry (BLOCK_M, BLOCK_N, LDS pools); a pool is (side, width, buffering) with
-# side 0 = A (M extent) / 1 = B (N extent), listed in g2s issue order: A pools first and the
-# deepest ones last, since the phase drain leaves exactly their writes in flight. A wave reads
-# half a pool, and the pool bytes sum to the 160KB LDS.
-_TN4_BLOCK = 256  # square macro tile, and the extent the dispatch heuristics reason in
-_TN4_SQUARE = (256, 256, ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 128, 3)))
+# Macro-tile geometry (BLOCK_M, BLOCK_N, LDS pools, mfma B step, issue spacing); a pool is
+# (side, width, buffering) with side 0 = A (M extent) / 1 = B (N extent), listed in g2s issue
+# order: A pools first and the deepest ones last, since the phase drain leaves exactly their
+# writes in flight. A wave reads half a pool, and the pool bytes sum to the 160KB LDS. The
+# B step is how many B columns one diagonal of the mfma sequence walks before it moves on
+# (0 = half the B tiles); a fragment is refilled right after its last consumer, so the step is
+# what sets how evenly those refills spread over the quadrant.
+_TN4_LINE = 128  # global cache line: a g2s row costs one request per line it spans
+_TN4_SQUARE = (256, 256, ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 128, 3)), 0, _TN4_PAD_ALL)
 # Same operand bytes per mfma as the square tile (1/BM + 1/BN is unchanged) at 1.5x / 0.75x
 # the extents, so a shape the square cannot tile onto whole CU rounds gets a finer grid at no
 # extra traffic. Costs 288 accumulators, 32 of them outside the AGPR file, and a 64-wide B
-# pool; the wide B pool takes the one spare buffer that fits under the 160KB LDS.
-_TN4_RECT = (384, 192, ((0, 128, 2), (0, 128, 2), (0, 128, 2), (1, 64, 2), (1, 128, 3)))
+# pool; the wide B pool takes the one spare buffer that fits under the 160KB LDS. Its B side
+# is split unevenly over two pools, so a wide diagonal step retires the narrow pool's tiles in
+# one burst and clusters their refills; stepping a single B column spreads them instead.
+_TN4_RECT = (
+    384,
+    192,
+    ((0, 128, 2), (0, 128, 2), (0, 128, 2), (1, 64, 2), (1, 128, 3)),
+    1,
+    _TN4_PAD_ALL,
+)
+_TN4_GEOMS = (_TN4_SQUARE, _TN4_RECT)
+
+
+def _tn4_pad(groups, pad):
+    """Space a phase's instruction groups at the boundaries ``pad`` names.
+
+    At one wave per SIMD the body's memory issue arrives in bursts a whole refill wide, which
+    back-pressures the matrix pipe; a wait state at the right boundaries keeps it fed. The last
+    group of a phase always takes one, since the drain follows it."""
+    kinds, out = "mdg", []
+    for i, (k, txt) in enumerate(groups):
+        out.append(txt)
+        if i + 1 == len(groups) or kinds[k] + kinds[groups[i + 1][0]] in pad:
+            out.append(_TN4_ISSUE_PAD)
+    return out
+
+
+def _tn4_phases(geom):
+    """K-blocks one main-loop pass consumes: the lcm of the pool depths, so a pass always
+    ends with every pool back on buffer 0."""
+    n = 1
+    for _side, _w, nbuf in geom[2]:
+        n = n * nbuf // math.gcd(n, nbuf)
+    return n
 
 
 class _Tn4Pool:
@@ -1078,10 +1125,13 @@ class _Tn4Pool:
 
     def __init__(self, side, width, nbuf, col):
         self.side, self.width, self.nbuf, self.col = side, width, nbuf, col
-        self.tiles = width // 32  # 16x16 mfma tiles a wave reads (two waves split the pool)
+        self.gcol = col  # column the tile actually reads/writes; _tn4_line_cols may rotate it
+        self.tiles = width // 32  # mfma tiles a wave reads (two waves split the pool)
         self.steps = width * _TN4_BLOCK_K // (256 * 16)  # dwordx4 G2S steps per buffer
         self.buf = width * _TN4_BLOCK_K  # bytes per buffer
-        self.rs = (width // 16) * _TN4_CS  # LDS delta between a tile's two transpose rows
+        # LDS delta between the halves of a tile's transpose reads: the read pair c and c+2 sit
+        # BLOCK_K/2 rows apart, which is (width // 16) chunk strides.
+        self.rs = (width // 16) * _TN4_CS
         assert (nbuf - 1) * self.buf + self.rs < 65536, "buffer delta overflows ds offset"
 
 
@@ -1093,6 +1143,25 @@ def _tn4_pools(geom):
         col[side] += width
     assert col == [geom[0], geom[1]], "pools must cover the macro tile exactly"
     return out
+
+
+def _tn4_line_cols(pools, geom, off):
+    """Point every pool's ``gcol`` at a cache-line-aligned column of its macro tile.
+
+    A g2s row costs one request per 128B line it spans, so a side whose extent is not a
+    whole number of lines is the expensive one: its tile origin lands mid-line on every
+    other tile, and whichever pool boundary was aligned for one parity straddles a line for
+    the other. Rotating that side's pool window by the complement of the misalignment swaps
+    the two boundary sets while covering the same columns, so the tile picks the aligned
+    one. Only pools whose window can rotate on a pool boundary take part."""
+    for p in pools:
+        extent = geom[p.side]
+        r = extent % _TN4_LINE
+        if r == 0 or any(q.side == p.side and q.col < r < q.col + q.width for q in pools):
+            continue
+        on_line = off[p.side] % fx.Int32(_TN4_LINE) == fx.Int32(0)
+        rot = fx.Int32((p.col + extent - r) % extent)
+        p.gcol = fx.Int32(_readfirstlane_i32(arith.select(on_line, rot, fx.Int32(p.col))))
 
 
 def _tn4_gl_keys(pools):
@@ -1160,9 +1229,176 @@ def _dense_tn_reduce_rows(
                 _buffer_ops.buffer_load(src[j], off, vec_width=_TN4_RED_VEC, dtype=ir_ty, mask=m),
             )
             acc = v if acc is None else arith.addf(acc, v)
+        _buffer_ops.buffer_store(arith.trunc_f(outv, acc), dst, off, mask=m, cache_modifier=_CSTORE_AUX)
+
+
+def _tn4_handoff(split):
+    """Whether this split-K window settles itself inside the kernel.
+
+    At two slices it can: slice 0 publishes its accumulators to scratch and raises the tile's
+    flag, slice 1 adds them into its own and is the only one to store C. That is one scratch
+    write plus one read against the reduce route's band write, its own two reads and one
+    write, and it retires the second dispatch. It is deadlock-free because a tile's slice j
+    sits at a strictly higher dispatch id than its slice j-1, and slice 0 never waits:
+    whatever a spinning slice needs was queued ahead of it. Deeper windows keep the reduce --
+    a chain of s waits serialises the epilogue s times over, which is the cost the fold's own
+    grid exists to spread."""
+    return split is not None and split[2] == _TN4_HAND_S
+
+
+def _tn4_handoff_wait(flag, off, want, rows):
+    """Spin until this tile's flag reads ``want``, then pass ``rows`` back out.
+
+    ``rows`` sizes the scratch descriptor the fold reads through and only reaches it via this
+    block, so the partial's loads cannot be hoisted above the wait. Slice 0 wants the resting
+    value and falls through on the first poll; a tile outside the window reads a zero-record
+    descriptor, which returns that same value."""
+    r = _llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32, i32)>"),
+        [arith._to_raw(v) for v in (flag, off, want, rows)],
+        "\n".join(
+            [
+                "1:",
+                "buffer_load_dword $0, $4, $3, 0 offen sc0 sc1",
+                "s_waitcnt vmcnt(0)",
+                "v_readfirstlane_b32 $1, $0",
+                "s_cmp_lg_u32 $1, $5",
+                "s_cbranch_scc0 2f",
+                "s_sleep 8",
+                "s_branch 1b",
+                "2:",
+                "s_mov_b32 $2, $6",
+            ]
+        ),
+        "=&v,=&s,=&s,s,v,s,s",
+        has_side_effects=True,
+    )
+    return fx.Int32(_llvm.extractvalue(T.i32, r, [2]))
+
+
+# Accumulators a lane hands over in one request. The slot is fragment-major and lane-contiguous,
+# so consecutive accumulators sit one lane stride apart and a lane can carry a whole pair: one
+# request covers 64 lanes x 16B instead of 8B. Halving the request count matters even to the
+# workgroups outside the window, whose stores and loads are dropped by a zero-record descriptor
+# but still occupy the vector memory pipe.
+_TN4_HAND_PACK = 2
+
+
+def _tn4_frag_off(wave_id, lane_id, q, nacc):
+    """Element offset of accumulator ``q``'s pack in a tile's handoff scratch slot.
+
+    Walking C's own layout instead would put a lane's four values in one column four rows
+    apart, i.e. four 32B runs per accumulator."""
+    lane_elems = 4 * _TN4_HAND_PACK
+    return (wave_id * fx.Int32(nacc) + fx.Int32(q)) * fx.Int32(256) + lane_id * fx.Int32(lane_elems)
+
+
+def _tn4_publish_frag(frag, rsrc, wave_id, lane_id, q0, nacc, out_ty, aux):
+    """Hand this slice's accumulators to the tile's scratch slot, unscaled: the folding slice
+    adds them to its own and its store is what applies the per-tensor scale, once. A slice
+    that owns no slot takes a zero-record descriptor and its stores drop."""
+    n = _TN4_HAND_PACK
+    assert len(frag) % n == 0 and q0 % n == 0, "handoff pack must divide the accumulator run"
+    for i in range_constexpr(len(frag) // n):
+        vals = [frag[n * i + h].to(out_ty) for h in range(n)]
         _buffer_ops.buffer_store(
-            arith.trunc_f(outv, acc), dst, off, mask=m, cache_modifier=_CSTORE_AUX
+            Vec.from_elements([v[j] for v in vals for j in range(4)], out_ty),
+            rsrc,
+            _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc),
+            cache_modifier=aux,
         )
+
+
+def _tn4_fold_frag(frag, rsrc, wave_id, lane_id, q0, nacc, out_ty, aux):
+    """Add the predecessor slice's published accumulators into this one's. A non-folding
+    slice reads a zero-record descriptor, which returns zero and leaves its own values."""
+    n = _TN4_HAND_PACK
+    assert len(frag) % n == 0 and q0 % n == 0, "handoff pack must divide the accumulator run"
+    out = []
+    for i in range_constexpr(len(frag) // n):
+        got = Vec(
+            _buffer_ops.buffer_load(
+                rsrc,
+                _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc),
+                vec_width=4 * n,
+                dtype=out_ty.ir_type,
+                cache_modifier=aux,
+            )
+        ).to(fx.Float32)
+        for h in range(n):
+            add = Vec.from_elements([got[4 * h + j] for j in range(4)], fx.Float32)
+            out.append(Vec(frag[n * i + h]) + add)
+    return out
+
+
+_TN4_PAIR_DPP = 0xB1  # quad_perm:[1,0,3,2] -- exchange within each lane pair
+# v_perm byte picks over {neighbour pack, own pack}: an even lane keeps both low halves, an
+# odd lane both high ones.
+_TN4_PAIR_SEL = (0x05040100, 0x03020706)
+
+
+class _StoreCTn4Paired(StoreCPerTensor):
+    """StoreCPerTensor whose adjacent n-fragments leave as one dword each.
+
+    An mfma D fragment hands a lane one column of a 16-column tile, so the scalar path's
+    16 lanes cover a 32 B run of an output row -- half a sector per request. A lane's two
+    fragments of a pair are 16 columns apart, but its neighbour lane's are the columns in
+    between: packing both fragments, taking the neighbour's pack over one DPP and keeping
+    two halves of the two leaves every lane holding two ADJACENT columns, so the pair goes
+    out as one dword and a row's 16 lanes cover 64 B. Same bytes, same values, half the
+    stores. Needs an even ``n_tiles_b`` and ``col_safe`` -- a pair is one access, so it
+    cannot be clamped per column."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.n_tiles_b % 2 == 0 and self.col_safe and not self.trans and not self.pack_cols
+        self._sel_v = None
+
+    def _sel(self):
+        """Per-lane v_perm selector, cached per emitting block (cf. StoreCPerTensor._scale)."""
+        blk = ir.InsertionPoint.current.block
+        if self._sel_v is None or self._sel_v[0] != blk:
+            even, odd = _TN4_PAIR_SEL
+            sel = arith.select(self.lane_id % 2 == fx.Int32(0), fx.Int32(even), fx.Int32(odd))
+            self._sel_v = (blk, arith._to_raw(sel))
+        return self._sel_v[1]
+
+    def _pair(self, lo, hi, sel):
+        """One dword: this lane's two columns of the (lo, hi) fragment pair."""
+        if self.elem_fn is not None:
+            lo, hi = self.elem_fn(lo), self.elem_fn(hi)
+        pk = arith._to_raw(
+            Vec.from_elements([lo.to(self.out_ty), hi.to(self.out_ty)], self.out_ty).bitcast(fx.Int32)[0]
+        )
+        nb = rocdl.update_dpp(pk.type, arith._to_raw(fx.Int32(0)), pk, _TN4_PAIR_DPP, 0xF, 0xF, True)
+        return Vec.from_elements([fx.Int32(rocdl.perm_b32(nb, pk, sel))], fx.Int32).bitcast(self.out_ty)
+
+    def store(self, c_frag, base_row, base_col, col_frags=()):
+        assert not col_frags, "paired store covers one quadrant"
+        scale = self._scale()
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        sel = self._sel()
+        # An even lane owns the pair's low fragment and an odd lane its high one, two columns
+        # each; the pair index rides the store's immediate offset as the fragment index did.
+        col0 = base_col + (self.lane_id % 2) * 16 + ((self.lane_id % 16) // 2) * 2
+        for ti in range_constexpr(self.n_tiles_a):
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
+            vecs = [
+                (Vec(c_frag[self.c_idx_fn(ti, tj)]) * scale)
+                if self.scaled
+                else Vec(c_frag[self.c_idx_fn(ti, tj)])
+                for tj in range_constexpr(self.n_tiles_b)
+            ]
+            for i in range_constexpr(4):
+                row_off = ((row_local + i) * self.c_cols + col0) * 2  # i32-small within band
+                for pj in range_constexpr(self.n_tiles_b // 2):
+                    _buffer_ops.buffer_store(
+                        self._pair(vecs[2 * pj][i], vecs[2 * pj + 1][i], sel),
+                        rsrc,
+                        row_off if pj == 0 else row_off + pj * 64,
+                        cache_modifier=self.store_aux,
+                        offset_is_bytes=True,
+                    )
 
 
 def _dense_tn_wave4_asm(geom, cbsz, blgp):
@@ -1181,6 +1417,10 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
     na = sum(pools[i].tiles for i in ap)
     nb = sum(pools[i].tiles for i in bp)
     nacc, ntmp = na * nb, na + nb  # accumulators, live operand fragments
+    phases = _tn4_phases(geom)
+    pad = geom[4]
+    dsep = f"\n{_TN4_ISSUE_PAD}\n" if "d" in pad else "\n"
+    gsep = f"\n{_TN4_ISSUE_PAD}\n" if "g" in pad else "\n"
     mods = f" cbsz:{cbsz} blgp:{blgp}" if (cbsz or blgp) else ""
     # Fragment -> (pool, tile in pool), and flat B operand -> (B pool slot, tile in pool).
     frag = [(i, t) for i in range(npool) for t in range(pools[i].tiles)]
@@ -1212,13 +1452,13 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
     i_rsrc = [(i_rsa, i_rsb)[p.side] for p in pools]
     i_kstep = [(i_ka, i_kb)[p.side] for p in pools]
 
-    def ds_line(rbuf, tt):
+    def ds_reads(rbuf, tt):
         # The buffer delta rides the ds_read immediate, so one address pair covers the pool.
         p, ti = frag[tt - nacc]
         bo = rbuf[p] * pools[p].buf
         v = _TN4_PIN + (tt - nacc) * 8
         ptr = (i_base[p][2 * ti], i_base[p][2 * ti + 1])
-        return "\n".join(
+        return dsep.join(
             f"ds_read_b64_tr_b8 v[{v + 2 * j}:{v + 2 * j + 1}], "
             f"${ptr[j % 2]} offset:{bo + (j // 2) * pools[p].rs}"
             for j in range(4)
@@ -1229,14 +1469,14 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
         order = [(p, st) for st in range(pools[0].steps) for p in ap]
         order += [(p, st) for p in bp for st in range(pools[p].steps)]
         return [
-            f"s_add_u32 m0, ${i_gbase[p][wbuf[p]]}, {st * _TN4_WAVES * _TN4_CS}\n"
+            f"s_add_u32 m0, ${i_gbase[p][wbuf[p]]}, {st * _TN4_WAVES * _TN4_CS}{gsep}"
             f"buffer_load_dwordx4 ${i_gl[p][st]}, ${i_rsrc[p]}, ${o_wsoff[p]} offen lds"
             for p, st in order
         ]
 
     def mfma_seq():
         # srcA pool outer (this mfma is srcA-movement sensitive); the diagonal spreads refills.
-        bm, bn = 2, nb // 2
+        bm, bn = 2, geom[3] or nb // 2
         nib, ncb = nt // bm, nb // bn
         seq = []
         for d in range(nib + ncb - 1):
@@ -1252,7 +1492,11 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
                             at = nacc + ah * nt + ii
                             br = nacc + na + col
                             seq.append(
-                                (f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, ${q}{mods}", at, br)
+                                (
+                                    f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, ${q}{mods}",
+                                    at,
+                                    br,
+                                )
                             )
         return seq
 
@@ -1268,23 +1512,23 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
         gslot = {fi: k // gap for k, fi in enumerate(free) if k % gap == 0 and k // gap < len(g2sl)}
         out, gi, refilled = [], 0, set()
         for mi, (ml, at, bt) in enumerate(mlist):
-            out.append(ml)
+            out.append((0, ml))
             for rt in (at, bt):
                 if last[rt] == mi and rt not in refilled:
-                    out.append(ds_line(rbuf, rt))
+                    out.append((1, ds_reads(rbuf, rt)))
                     refilled.add(rt)
             if mi in gslot and gi < len(g2sl):
-                out.append(g2sl[gi])
+                out.append((2, g2sl[gi]))
                 gi += 1
-        out += g2sl[gi:]
-        out += [ds_line(rbuf, tt) for tt in range(nacc, nacc + ntmp) if tt not in refilled]
-        return out
+        out += [(2, g) for g in g2sl[gi:]]
+        out += [(1, ds_reads(rbuf, tt)) for tt in range(nacc, nacc + ntmp) if tt not in refilled]
+        return _tn4_pad(out, pad)
 
     # Partial drain: a buffer written this phase is read again nbuf-1 phases later, so only
     # a more-than-double-buffered pool may leave its writes in flight past the barrier.
     tailp = [i for i, p in enumerate(pools) if p.nbuf > 2]
     assert tailp == list(range(npool - len(tailp), npool)), "deep pools must be issued last"
-    assert all(_TN4_PHASES % p.nbuf == 0 for p in pools), "a pass must end on every pool's buf 0"
+    assert all(phases % p.nbuf == 0 for p in pools), "a pass must end on every pool's buf 0"
     n_out = sum(pools[i].steps for i in tailp)
     drain = f"s_waitcnt vmcnt({n_out}) lgkmcnt({_TN4_ELGK})\ns_barrier"
 
@@ -1295,13 +1539,13 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
 
     L = [f"s_mov_b32 ${o_cnt}, 0"]
     L += [f"s_mov_b32 ${o_wsoff[p]}, ${i_soff0[p]}" for p in range(npool)]
-    L += [ds_line([0] * npool, tt) for tt in range(nacc, nacc + ntmp)]
+    L += [ds_reads([0] * npool, tt) for tt in range(nacc, nacc + ntmp)]
     # Deeper primes wait here to overlap the ds_read issue; the barrier still guards buf0.
     L += [f"s_waitcnt vmcnt({n_out}) lgkmcnt(0)", "s_barrier", "1:"]
-    for ph in range(_TN4_PHASES):
+    for ph in range(phases):
         L += phase_block(ph)
     L += [
-        f"s_add_u32 ${o_cnt}, ${o_cnt}, {_TN4_PHASES}",
+        f"s_add_u32 ${o_cnt}, ${o_cnt}, {phases}",
         f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}",
         "s_cbranch_scc1 1b",
         # A partial drain needs a next phase, which no longer exists past the exit.
@@ -1311,7 +1555,7 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
         "s_barrier",
         "3:",
     ]
-    for j in range(_TN4_PHASES - 1):  # gated single-K-block passes reusing the loop block
+    for j in range(phases - 1):  # gated single-K-block passes reusing the loop block
         L += [f"s_cmp_le_u32 ${i_tail}, {j}", f"s_cbranch_scc1 {j + 4}f"]
         L += phase_block(j) + [f"{j + 4}:"]
     L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
@@ -1354,6 +1598,7 @@ def _dense_tn_wave4_tile(
     group_m,
     group_n,
     split,
+    handoff,
     store_aux,
     lds,
     geom,
@@ -1361,6 +1606,7 @@ def _dense_tn_wave4_tile(
     B,
     C,
     WS,
+    FL,
     A_scale,
     B_scale,
     gl_off,
@@ -1375,8 +1621,10 @@ def _dense_tn_wave4_tile(
 ):
     """Emit one dispatch id's output tile. ``split`` is None or the (lo, n, s) split-K window,
     which always sits at the grid tail: ids from lo up carry a (tile, slice) pair, slice 0
-    writing C and slice j>0 band j-1 of WS, and kernel_dense_tn_wave4_reduce folds them."""
-    row_shift, store_base, sid, whole = None, None, None, None
+    writing C and slice j>0 band j-1 of WS, and kernel_dense_tn_wave4_reduce folds them. Under
+    ``handoff`` every slice writes C instead and the last one folds its predecessor in."""
+    row_shift, store_base, sid, whole, c_rows = None, None, None, None, None
+    flag, flag_off, pub, fold, slot, slot_base = None, None, None, None, 0, None
     k0 = fx.Int32(0)
     ki = fx.Int32(K_ITERS)
     if split is None:
@@ -1409,23 +1657,50 @@ def _dense_tn_wave4_tile(
             k0 = fx.Int32(arith.select(whole, fx.Int32(0), k0))
             ki = fx.Int32(arith.select(whole, fx.Int32(K_ITERS), ki))
         ki = fx.Int32(_readfirstlane_i32(ki))
-        # Slice 0 lands in C itself and slice j>0 owns WS rows [(j-1)*M, j*M), so the store
-        # only moves its band base and the fold walks the bands with one stride. Keeping
-        # slice 0 in C is what leaves the scratch at s-1 bands instead of s.
-        row_shift = _readfirstlane_i32((sc - fx.Int32(1)) * fx.Int32(M))
-        store_base = _buffer_ops.extract_base_index(WS)
-        home = sc < fx.Int32(1)  # whole tiles carry sc = 0, so this covers them too
-        row_shift = _readfirstlane_i32(arith.select(home, fx.Int32(0), fx.Int32(row_shift)))
-        store_base = arith.select(home, _buffer_ops.extract_base_index(C), store_base)
+        if handoff:
+            # Which side of the protocol this dispatch id is on. The epilogue branches on it,
+            # so a slice issues only its own half and a tile below the window -- sid is -1
+            # there -- issues none of it.
+            slot = geom[0] * geom[1] * 2
+            live = fx.Int32(slot)
+            pub = sid == fx.Int32(0)
+            fold = sid == fx.Int32(1)
+            fold_rec = fx.Int32(_readfirstlane_i32(arith.select(fold, live, fx.Int32(0))))
+            pub_rec = arith.index_cast(
+                T.index, fx.Int32(_readfirstlane_i32(arith.select(pub, live, fx.Int32(0))))
+            )
+            slot_base = arith.index_cast(T.index, fx.Int32(_readfirstlane_i32(tin))) * arith.index(slot)
+            hand_st = _buffer_ops.create_buffer_resource(
+                WS, max_size=False, num_records_bytes=pub_rec, base_byte_offset=slot_base
+            )
+            nrec = arith.index(4 * nwin)
+            if lo:
+                nrec = arith.select(whole, arith.index(0), nrec)
+            flag = _buffer_ops.create_buffer_resource(FL, max_size=False, num_records_bytes=nrec)
+            flag_off = fx.Int32(_readfirstlane_i32(tin)) * fx.Int32(4)
+            flag_val = fx.Int32(1) - sc
+            # The publishing slice writes no C at all, so its output band bases zero records.
+            c_rows = fx.Int32(_readfirstlane_i32(arith.select(pub, fx.Int32(0), fx.Int32(M))))
+        else:
+            # Slice 0 lands in C itself and slice j>0 owns WS rows [(j-1)*M, j*M), so the store
+            # only moves its band base and the fold walks the bands with one stride. Keeping
+            # slice 0 in C is what leaves the scratch at s-1 bands instead of s.
+            row_shift = _readfirstlane_i32((sc - fx.Int32(1)) * fx.Int32(M))
+            store_base = _buffer_ops.extract_base_index(WS)
+            home = sc < fx.Int32(1)  # whole tiles carry sc = 0, so this covers them too
+            row_shift = _readfirstlane_i32(arith.select(home, fx.Int32(0), fx.Int32(row_shift)))
+            store_base = arith.select(home, _buffer_ops.extract_base_index(C), store_base)
 
     pools = _tn4_pools(geom)
+    phases = _tn4_phases(geom)
     apool = [p for p in pools if p.side == 0]
     bpool = [p for p in pools if p.side == 1]
     block_m, block_n = _dense_tn_tile_mn(t, NBM, NBN, group_m, group_n)
     bm_off = _readfirstlane_i32(block_m) * fx.Int32(geom[0])
     bn_off = _readfirstlane_i32(block_n) * fx.Int32(geom[1])
-    # Main loop takes the largest multiple of _TN4_PHASES; the remainder is the in-asm tail.
-    n6 = (ki // _TN4_PHASES) * _TN4_PHASES
+    _tn4_line_cols(pools, geom, (bm_off, bn_off))
+    # Main loop takes the largest multiple of the pass length; the remainder is the in-asm tail.
+    n6 = (ki // phases) * phases
     nval = _readfirstlane_i32(n6)
     tail = _readfirstlane_i32(ki - n6)
 
@@ -1466,9 +1741,10 @@ def _dense_tn_wave4_tile(
         )
 
     mfma = {p.tiles: Mfma16x16x128(apool[0].tiles, p.tiles) for p in bpool}
-    c_rows = fx.Int32(M) if row_shift is None else fx.Int32(M) + row_shift
+    if c_rows is None:
+        c_rows = fx.Int32(M) if row_shift is None else fx.Int32(M) + row_shift
     store_c = {
-        nb: StoreCPerTensor(
+        nb: (_StoreCTn4Paired if col_safe and nb % 2 == 0 else StoreCPerTensor)(
             A_scale,
             B_scale,
             C,
@@ -1491,18 +1767,15 @@ def _dense_tn_wave4_tile(
     for b in range(max(p.nbuf for p in pools)):
         for i, p in enumerate(pools):
             if b < p.nbuf:
-                g2s[(p.side, p.width)].load(
-                    pool_lds[i], p.col + b * (a_k, b_k)[p.side], base_off=fx.Int32(b * p.buf)
-                )
+                kb = b * (a_k, b_k)[p.side]
+                col = p.gcol if isinstance(p.gcol, int) else arith.index_cast(T.index, p.gcol)
+                g2s[(p.side, p.width)].load(pool_lds[i], col + kb, base_off=fx.Int32(b * p.buf))
     # Covers the buf0 primes only; the deeper ones are waited on inside the asm.
     wait_barrier(sum((p.nbuf - 1) * p.steps for p in pools))
 
     # A pool's buffers are read the same way, so only buffer 0 needs live address VGPRs.
     ins = [
-        v
-        for i, p in enumerate(pools)
-        for pair in s2r[(p.side, p.width)].base_addr(pool_lds[i])
-        for v in pair
+        v for i, p in enumerate(pools) for pair in s2r[(p.side, p.width)].base_addr(pool_lds[i]) for v in pair
     ]
     ins += [
         rocdl.readfirstlane(
@@ -1533,22 +1806,53 @@ def _dense_tn_wave4_tile(
     # soff0[p] = the global offset of the first in-loop write, targeting K-block p.nbuf.
     for p in pools:
         step = fx.Int32(p.nbuf) * (kstep_a, kstep_b)[p.side]
-        ins.append(rocdl.readfirstlane(T.i32, step if p.col == 0 else fx.Int32(p.col) + step))
+        if isinstance(p.gcol, int):
+            soff = step if p.gcol == 0 else fx.Int32(p.gcol) + step
+        else:
+            soff = p.gcol + step
+        ins.append(rocdl.readfirstlane(T.i32, soff))
     nacc = sum(p.tiles for p in apool) * sum(p.tiles for p in bpool)
     ins += [mfma[bpool[0].tiles].zero_value] * min(nacc, _TN4_AGPR)
 
     asm, cons, st = _dense_tn_wave4_asm(geom, cbsz, blgp)
     r = _llvm.inline_asm(ir.Type.parse(st), [arith._to_raw(v) for v in ins], asm, cons, has_side_effects=True)
-    res = [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(nacc)]
+    acc_ty = ir.Type.parse("vector<4xf32>")
+    res = [Vec(_llvm.extractvalue(acc_ty, r, [q])) for q in range_constexpr(nacc)]
 
     row_q = bm_off + wave_m * fx.Int32(apool[0].tiles * 16)
     base_row = row_q if row_shift is None else row_q + row_shift
+
+    if handoff:
+        _tn4_publish_frag(res, hand_st, wave_id, lane_id, 0, nacc, out_ty, handoff)
+        # The raise has to trail this tile's own stores, which only reach the folding slice
+        # once they have retired; the second barrier keeps a wave that is through the poll
+        # from resetting the flag while another of its waves is still spinning on it.
+        wait_barrier(0)
+        recs = _tn4_handoff_wait(flag, flag_off, sc, fold_rec)
+        wait_barrier(0)
+        _buffer_ops.buffer_store(
+            flag_val,
+            flag,
+            flag_off,
+            mask=lane_id == fx.Int32(0),
+            cache_modifier=_TN4_HAND_AUX,
+            offset_is_bytes=True,
+        )
+        hand_ld = _buffer_ops.create_buffer_resource(
+            WS,
+            max_size=False,
+            num_records_bytes=arith.index_cast(T.index, recs),
+            base_byte_offset=slot_base,
+        )
     q = 0
     for pa in apool:
         for pb in bpool:
             n = pa.tiles * pb.tiles
             col_q = bn_off + wave_n * fx.Int32(pb.tiles * 16)
-            store_c[pb.tiles].store(res[q : q + n], base_row + pa.col, col_q + pb.col)
+            frag = res[q : q + n]
+            if handoff:
+                frag = _tn4_fold_frag(frag, hand_ld, wave_id, lane_id, q, nacc, out_ty, handoff)
+            store_c[pb.tiles].store(frag, base_row + pa.gcol, col_q + pb.gcol)
             q += n
 
 
@@ -1557,7 +1861,7 @@ _TN4_RCP_MAX = 1 << 15  # exactness bound on _dense_tn_slice_div's dividend
 _TN4_OUT_ALIGN = 8  # out_ty elements the split-K bands keep aligned at C's row pitch
 
 
-def _dense_tn_split(tiles, k_iters, ncu):
+def _dense_tn_split(tiles, k_iters, ncu, phases=_TN4_PHASES):
     """Split-K window ``(lo, n, s)`` for one dense TN grid, or None. With one uniform K the
     makespan quantizes only on the last partial round, so slice its ``rem`` tiles s ways;
     keep the shortest s that still fits the window inside one round."""
@@ -1566,7 +1870,7 @@ def _dense_tn_split(tiles, k_iters, ncu):
         return None
     best, wn, wd = 1, 1, 1
     for s in _TN4_SPLIT_S:
-        if k_iters < _TN4_PHASES * s or k_iters * (s - 1) >= _TN4_RCP_MAX:
+        if k_iters < phases * s or k_iters * (s - 1) >= _TN4_RCP_MAX:
             continue  # every slice must keep a whole main-loop pass, and stay exactly divisible
         rounds = ceildiv(rem * s, ncu) if tiles <= ncu else (1 if s * rem <= ncu else s)
         if rounds * wd < wn * s:
@@ -1600,20 +1904,21 @@ def _compile_dense_tn_wave4(
     tile per workgroup. Returns (launch, split-K scratch band count)."""
     BM, BN = geom[0], geom[1]
     _pools = _tn4_pools(geom)
+    _PH = _tn4_phases(geom)
     NBM, NBN = ceildiv(M, BM), ceildiv(N, BN)
     TILES = NBM * NBN
     K_ITERS = ceildiv(K, _TN4_BLOCK_K)
-    assert K_ITERS >= _TN4_PHASES, "4-wave dense TN needs a K of at least one main-loop pass"
-    split = _dense_tn_split(TILES, K_ITERS, _dense_num_cus())
+    assert K_ITERS >= _PH, "4-wave dense TN needs a K of at least one main-loop pass"
+    split = _dense_tn_split(TILES, K_ITERS, _dense_num_cus(), _PH)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+    # Doubles as the switch and as the index into the handoff's traffic policy, and it is a
+    # closure scalar, which is what puts it in the jit cache key (module globals are not).
+    _hand = _TN4_HAND_AUX if _tn4_handoff(split) else 0
     # Slice 0 keeps C, so the WS holds s-1 bands; the window's tiles each take s-1
     # workgroups beyond the base grid.
     _bands = 0 if split is None else split[2] - 1
     _NWIN = 0 if split is None else split[1]
     _GRID = TILES + _NWIN * (split[2] - 1 if split is not None else 0)
-    # Slice bands are read straight back by the reduce, so a window that dominates the grid
-    # keeps its stores cached; a small window leaves C write-once and takes the nt hint.
-    _STORE_AUX = _CSTORE_AUX if 2 * (_GRID - TILES) <= _GRID else 0
 
     # ONE field per pool, holding all of its buffers back to back: the whole-loop reaches
     # buffer b off buffer 0's address with a b*bytes ds_read immediate, and separate fields
@@ -1624,8 +1929,7 @@ def _compile_dense_tn_wave4(
             (),
             {
                 "__annotations__": {
-                    f"p{i}": fx.Array[fx.Float8E4M3FN, p.nbuf * p.buf, 16]
-                    for i, p in enumerate(_pools)
+                    f"p{i}": fx.Array[fx.Float8E4M3FN, p.nbuf * p.buf, 16] for i, p in enumerate(_pools)
                 }
             },
         )
@@ -1639,6 +1943,7 @@ def _compile_dense_tn_wave4(
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         WS: fx.Tensor,
+        FL: fx.Tensor,
     ):
         _ = str(fx.thread_idx.x)
         lane_id = fx.thread_idx.x % 64
@@ -1655,12 +1960,14 @@ def _compile_dense_tn_wave4(
             group_n=group_n,
             geom=geom,
             split=split,
-            store_aux=_STORE_AUX,
+            handoff=_hand,
+            store_aux=_CSTORE_AUX,
             lds=fx.SharedAllocator().allocate(SharedStorage).peek(),
             A=A,
             B=B,
             C=C,
             WS=WS,
+            FL=FL,
             A_scale=A_scale,
             B_scale=B_scale,
             gl_off={
@@ -1687,7 +1994,7 @@ def _compile_dense_tn_wave4(
     _ATTRS = make_value_attrs(1, 0, "256,256")
     _LO = 0 if split is None else split[0]
     _S = 0 if split is None else split[2]
-    _RED_GRID = _NWIN * _TN4_RED_WPT
+    _RED_GRID = 0 if _hand else _NWIN * _TN4_RED_WPT
     _RED_ROWS = BM // _TN4_RED_WPT
 
     @flyc.kernel(known_block_size=[256, 1, 1])
@@ -1724,9 +2031,10 @@ def _compile_dense_tn_wave4(
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         WS: fx.Tensor,
+        FL: fx.Tensor,
         stream: fx.Stream,
     ):
-        kernel_dense_tn_wave4(A, B, C, A_scale, B_scale, WS, value_attrs=_ATTRS).launch(
+        kernel_dense_tn_wave4(A, B, C, A_scale, B_scale, WS, FL, value_attrs=_ATTRS).launch(
             grid=(_GRID, 1, 1), block=(256, 1, 1), stream=stream
         )
         if const_expr(_RED_GRID):
@@ -1923,9 +2231,13 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
 
 _TN_WAVE4_CACHE: dict = {}
 _TN4_WS_CACHE: dict = {}
-# TN whole-loop band: tiles visited before moving on, sized to keep operand slabs L2-resident.
-_TN_WAVE4_BAND = (4, 2)
-_TN_WAVE4_TALL_GM = 2  # M super-row once N is the grid's short axis (see _tn_wave4_band)
+_TN4_FLAG_CACHE: dict = {}
+_TN4_PLAN_CACHE: dict = {}
+# Makespan spread inside which the model does not get to order the macro tiles: below it the
+# two predictions sit closer together than the shapes they disagree on actually measure.
+_TN4_MS_MARGIN = 1.05
+# XCDs the dispatcher hands workgroups to round-robin; each fills a private L2 slice.
+_TN4_XCD = 8
 
 
 def _tn_wave4_supported(N: int, K: int, i64_traverse: bool) -> bool:
@@ -1935,33 +2247,93 @@ def _tn_wave4_supported(N: int, K: int, i64_traverse: bool) -> bool:
     return (not i64_traverse) and N % _TN4_OUT_ALIGN == 0 and ceildiv(K, _TN4_BLOCK_K) >= _TN4_PHASES
 
 
-def _tn_wave4_band(M, N, geom):
-    """(group_m, group_n) for one TN output shape. On a grid taller than it is wide the N
-    extent is only a handful of tiles, so a fixed band width leaves a ragged last band whose
-    tile count no longer divides the XCD round-robin; take all of N as one band instead and
-    swizzle M inside it. Otherwise band N and keep one A slab serving the stripes."""
-    n_blocks = ceildiv(N, geom[1])
-    if n_blocks < ceildiv(M, geom[0]):
-        return _TN_WAVE4_TALL_GM, n_blocks
-    group_m, group_n = _TN_WAVE4_BAND
-    return group_m, min(group_n, n_blocks)
+def _tn4_band_group(stripes):
+    """Snap a group height to a divisor of _TN4_XCD. Only on a divisor do the workgroups one
+    XCD owns within a group share a block_m, which is what keeps its resident set a rectangle
+    instead of a staircase spanning every row the group covers."""
+    return min((1, 2, 4, 8), key=lambda g: abs(math.log(max(stripes, 0.5) / g)))
 
 
-def _tn4_geom(M, N, k_iters, ncu):
-    """Macro tile for one TN shape. Both geometries move the same operand bytes per mfma
-    (1/BM + 1/BN is equal), so the rectangle earns its wider accumulator file only on the
-    dispatch: take it when its finer grid tiles the device in whole rounds outright, or when
-    the square cannot even fill the device once. Anywhere else the rectangle would be the one
-    needing the split-K window, and the reduce it pays for costs more than the tail it saves."""
-    tiles = ceildiv(M, _TN4_RECT[0]) * ceildiv(N, _TN4_RECT[1])
-    if tiles % ncu == 0:
-        return _TN4_RECT
-    if ceildiv(M, _TN4_BLOCK) * ceildiv(N, _TN4_BLOCK) < ncu:
-        split = _dense_tn_split(tiles, k_iters, ncu)
-        grid = tiles if split is None else tiles + split[1] * (split[2] - 1)
-        if grid % ncu == 0:
-            return _TN4_RECT
-    return _TN4_SQUARE
+def _tn_wave4_band(M, N, geom, ncu):
+    """(group_m, group_n) for one TN output shape, sized by what a single XCD holds at once.
+
+    Workgroups reach the XCDs round-robin and the whole-loop runs one per CU, so an XCD is
+    resident on ncu / _TN4_XCD tiles and pulls (#block_m) * BM + (#block_n) * BN operand
+    bytes through its own L2 slice per K-block. Those two counts multiply to the resident
+    count, so the bytes are least when the rectangle is stretched along whichever extent is
+    cheaper to repeat: #block_n = sqrt(resident * BM / BN). A band spreads that many stripes
+    across its width; a tall grid, where N is a handful of tiles and a band would leave a
+    ragged last one, has to spread them inside the group instead."""
+    m_blocks, n_blocks = ceildiv(M, geom[0]), ceildiv(N, geom[1])
+    resident = ncu / _TN4_XCD
+    stripes = math.sqrt(resident * geom[0] / geom[1])
+    if n_blocks < m_blocks:
+        return _tn4_band_group(stripes * _TN4_XCD / n_blocks), n_blocks
+    group_m = _tn4_band_group(stripes * m_blocks / resident)
+    return group_m, min(_TN4_XCD // group_m, n_blocks)
+
+
+def _tn4_split_rounds(tiles, n, s, ncu):
+    """Rounds the split-K window's ``n * s`` slices occupy, as _dense_tn_split scored them."""
+    return ceildiv(n * s, ncu) if tiles <= ncu else (1 if s * n <= ncu else s)
+
+
+def _tn4_geom_split(M, N, K, ncu, geom):
+    """This geometry's split-K window, at its own BLOCK_K."""
+    tiles = ceildiv(M, geom[0]) * ceildiv(N, geom[1])
+    return _dense_tn_split(tiles, ceildiv(K, _TN4_BLOCK_K), ncu, _tn4_phases(geom))
+
+
+def _tn4_makespan(M, N, K, ncu, geom):
+    """Device time one geometry needs for this shape, in macro-tile cells: full tiles retire
+    ncu at a time and the split-K window's slices, being 1/s of a tile each, share the rounds
+    they land in. It only orders the candidates; the race is what picks one."""
+    tiles = ceildiv(M, geom[0]) * ceildiv(N, geom[1])
+    cells = geom[0] * geom[1]
+    split = _tn4_geom_split(M, N, K, ncu, geom)
+    if split is None:
+        return ceildiv(tiles, ncu) * cells
+    lo, n, s = split
+    return (lo // ncu) * cells + _tn4_split_rounds(tiles, n, s, ncu) * cells / s
+
+
+def _tn4_grid(M, N, K, ncu, geom):
+    """Workgroups one geometry launches: its tiles, plus the extra slice per split-K window
+    tile. Returns ``(grid, bands, flags)`` in units of the M x N scratch band: the reduce
+    route needs s-1 of them (slice 0 keeps C), the handoff one fragment-ordered slot per
+    window tile, plus a flag each."""
+    tiles = ceildiv(M, geom[0]) * ceildiv(N, geom[1])
+    split = _tn4_geom_split(M, N, K, ncu, geom)
+    if split is None:
+        return tiles, 0, 0
+    grid = tiles + split[1] * (split[2] - 1)
+    if _tn4_handoff(split):
+        return grid, ceildiv(split[1] * geom[0] * geom[1], M * N), split[1]
+    return grid, split[2] - 1, 0
+
+
+def _tn4_plan(M, N, K, ncu):
+    """Whole-loop macro tiles for one TN shape, most promising first, and the scratch bands
+    and handoff flags the widest of them needs. Ordered by predicted makespan, and on the
+    shapes the model calls close, by the geometry that launches fewer workgroups: the two
+    retire the same operand bytes per mfma, so a smaller grid is fewer tile prologues and a
+    smaller reduce. Memoised because the steady-state launch path reads it on every call."""
+    key = (M, N, K, ncu)
+    plan = _TN4_PLAN_CACHE.get(key)
+    if plan is None:
+        scored = []
+        for g in _TN4_GEOMS:
+            grid, bands, flags = _tn4_grid(M, N, K, ncu, g)
+            scored.append((_tn4_makespan(M, N, K, ncu, g), grid, bands, flags, g))
+        lo = min(s[0] for s in scored)
+        scored.sort(key=lambda s: (s[0] > lo * _TN4_MS_MARGIN, s[1]))
+        plan = (
+            tuple(s[4] for s in scored),
+            max(s[2] for s in scored),
+            max(s[3] for s in scored),
+        )
+        _TN4_PLAN_CACHE[key] = plan
+    return plan
 
 
 def _tn_wave4_workspace(M, N, bands, device, dtype, out):
@@ -1978,18 +2350,49 @@ def _tn_wave4_workspace(M, N, bands, device, dtype, out):
     return ws
 
 
-def _tn_wave4_dispatch(M, N, K, cbsz=0, blgp=0, out_fp16=False):
-    """Compile (or cache-hit) the 4-wave whole-loop launch for one TN problem, plus the band
-    count its split-K workspace needs. Returns ``(entry, bands)``."""
+def _tn_wave4_flags(n, device):
+    """Handoff flags, one per split-K window tile and zero at rest: slice 0 raises its tile's
+    flag once its partial is device-visible and the folding slice clears it again, so one
+    buffer serves every launch. Kept per (size, device) for the same reason the scratch is."""
+    key = (device.index, max(n, 1))
+    fl = _TN4_FLAG_CACHE.get(key)
+    if fl is None:
+        fl = torch.zeros(max(n, 1), device=device, dtype=torch.int32)
+        _TN4_FLAG_CACHE[key] = fl
+    return fl
+
+
+def _tn_wave4_dispatch(args, M, N, K, geoms, cbsz=0, blgp=0, out_fp16=False):
+    """First-call race of the whole-loop macro tiles for one TN problem, best (launch, cfg)
+    cached by (M,N,K); each is finite-checked before it is timed (see _pick_dense_candidate).
+    The makespan model orders them, and the two are close enough on the shapes it calls a tie
+    that the bench, not the model, gets to settle those. The losing candidates stay in the
+    cache entry: _get_compiled_dense keys on the launch object, so freeing one would let a
+    later launch reuse its id and hit a stale compile."""
     key = (M, N, K, cbsz, blgp, out_fp16)
     hit = _TN_WAVE4_CACHE.get(key)
-    if hit is None:
-        geom = _tn4_geom(M, N, ceildiv(K, _TN4_BLOCK_K), _dense_num_cus())
-        group_m, group_n = _tn_wave4_band(M, N, geom)
-        launch, bands = _compile_dense_tn_wave4(M, N, K, group_m, group_n, geom, cbsz, blgp, out_fp16)
-        hit = ([launch, (geom[0], group_m, group_n, 1), None], bands)
-        _TN_WAVE4_CACHE[key] = hit
-    return hit
+    if hit is not None:
+        return hit[0]
+    out_view = args[2]
+    ncu = _dense_num_cus()
+    cands = []
+    for geom in geoms:
+        try:
+            group_m, group_n = _tn_wave4_band(M, N, geom, ncu)
+            launch, _bands = _compile_dense_tn_wave4(M, N, K, group_m, group_n, geom, cbsz, blgp, out_fp16)
+            c = _get_compiled_dense(launch, args)
+            c(*args)
+            torch.cuda.synchronize()
+            if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                continue
+            cands.append([launch, (geom[0], geom[1], group_m, group_n), c])
+        except Exception:
+            continue
+    if not cands:
+        raise RuntimeError(f"TN whole-loop found no working cfg for ({M},{N},{K})")
+    best = _pick_dense_candidate(cands, args)
+    _TN_WAVE4_CACHE[key] = (best, cands)
+    return best
 
 
 _TN_AUTOTUNE_CACHE: dict = {}
@@ -2084,7 +2487,9 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         # per-load i64 SRD re-base (else the 32-bit soffset wraps).
         i64_tr = (K * M >= cap) or (K * N >= cap)
         if _tn_wave4_supported(N, K, i64_tr):
-            entry, bands = _tn_wave4_dispatch(M, N, K, cbsz, blgp, out_fp16)
+            # One scratch sized for whichever candidate wants the most bands: the losing
+            # geometry never reads past its own, so the race can share the buffer.
+            geoms, bands, flags = _tn4_plan(M, N, K, _dense_num_cus())
             wargs = (
                 _dense_operand(a),
                 _dense_operand(b),
@@ -2092,9 +2497,10 @@ def gemm_fp8_tensorwise_flydsl_kernel(
                 a_scale_v,
                 b_scale_v,
                 _tn_wave4_workspace(M, N, bands, device, out_dtype, out),
+                _tn_wave4_flags(flags, device),
                 _raw_stream(device.index),
             )
-            _run_dense(entry, wargs)
+            _run_dense(_tn_wave4_dispatch(wargs, M, N, K, geoms, cbsz, blgp, out_fp16), wargs)
         else:
             args = (
                 _dense_operand(a),
