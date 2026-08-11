@@ -59,6 +59,8 @@ from flydsl.expr.typing import Vector as Vec
 # `nt` aux bit: C is write-once, so caching it evicts the A/B band the L2 swizzle keeps.
 _CSTORE_AUX = 2
 
+_PICK_RAMP_ITERS = 200
+
 
 @functools.lru_cache(maxsize=256)
 def _compile_dense_nt(
@@ -385,6 +387,62 @@ def _compile_dense_nt(
 
 # ──────────────────────────────────────────────────────────────────────
 
+_DPP_QUAD_SWAP1 = 0xB1  # quad_perm:[1,0,3,2] -- exchange with the neighbouring lane
+_PERM_LO_PAIR = 0x05040100  # {own low half, right neighbour's low half}
+_PERM_HI_PAIR = 0x03020706  # {left neighbour's high half, own high half}
+
+
+class StoreCPerTensorPairN(StoreCPerTensor):
+    """StoreCPerTensor folding a row's two n-fragments into one dword store: a fragment
+    row spans 16 lanes, so a scalar 2 B store leaves as a 32 B request and the pair
+    doubles it. Needs an even c_cols -- the pair is written as a unit."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert not self.trans and not self.pack_cols and self.n_tiles_b % 2 == 0
+        assert self.out_ty is fx.BFloat16, "the packed convert is bf16-only"
+        lane16 = self.lane_id % 16
+        hi = (lane16 % 2) > 0
+        # even lane e holds columns (e, e+1); odd lane o holds (16 + o - 1, 16 + o).
+        self.pair_col = arith.select(hi, lane16 + 15, lane16)
+        self.pair_sel = arith.select(hi, fx.Int32(_PERM_HI_PAIR), fx.Int32(_PERM_LO_PAIR))
+
+    def store(self, c_frag, base_row, base_col, col_frags=()):
+        """Row band store; see StoreCPerTensor.store for the col_frags contract."""
+        scale = self._scale()
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        quads = [(0, c_frag)] + [(int(d), f) for d, f in col_frags]
+        col0 = base_col + self.pair_col
+        zero = arith._to_raw(fx.Int32(0))
+        for ti in range_constexpr(self.n_tiles_a):
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
+            vecs = [
+                [
+                    (Vec(f[self.c_idx_fn(ti, tj)]) * scale) if self.scaled else Vec(f[self.c_idx_fn(ti, tj)])
+                    for tj in range_constexpr(self.n_tiles_b)
+                ]
+                for _, f in quads
+            ]
+            for i in range_constexpr(4):
+                row_off = ((row_local + i) * self.c_cols + col0) * 2  # i32-small within band
+                for q in range_constexpr(len(quads)):
+                    for p in range_constexpr(self.n_tiles_b // 2):
+                        dcol = quads[q][0] + p * 32
+                        lo, hi = vecs[q][2 * p][i], vecs[q][2 * p + 1][i]
+                        if self.elem_fn is not None:
+                            lo, hi = self.elem_fn(lo), self.elem_fn(hi)
+                        pk = rocdl.cvt_pk_bf16_f32(lo, hi)
+                        sw = rocdl.update_dpp(pk.type, zero, pk, _DPP_QUAD_SWAP1, 0xF, 0xF, True)
+                        pair_ok = None if self.col_safe else (col0 + dcol + 1) < self.c_cols
+                        _buffer_ops.buffer_store(
+                            rocdl.perm_b32(sw, pk, self.pair_sel),
+                            rsrc,
+                            row_off if dcol == 0 else row_off + dcol * 2,
+                            mask=pair_ok,
+                            cache_modifier=self.store_aux,
+                            offset_is_bytes=True,
+                        )
+
 
 @functools.lru_cache(maxsize=128)
 def _compile_dense_nn(
@@ -392,6 +450,7 @@ def _compile_dense_nn(
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     GROUP_M: int = 4,
+    group_n: int = 0,  # 0 = 1D GROUP_M swizzle; >0 = 2D band (width group_n), as in NT
     num_xcd: int = 8,  # XCD-aware PID remap for per-XCD L2 reuse (MI355X = 8 XCD); 1 disables. See xcd_remap_pid.
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
@@ -403,6 +462,8 @@ def _compile_dense_nn(
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
     i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts k*n < 2^32 cap)
+    pair_n: bool = False,  # fold the n-fragment pair into one dword store (needs even N)
+    col_safe: bool = False,  # N % BLOCK_N == 0: drop the epilogue's per-store column clamp
 ):
     """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N].
 
@@ -476,18 +537,9 @@ def _compile_dense_nn(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        # Super-block tile swizzle for L2 reuse; group_size_m clamps the last
-        # band so any GROUP_M >= 1 is correct (same as NT).
         num_pid_m = ceildiv(c_m, BLOCK_M)
         pid = xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
-        num_pid_in_group = GROUP_M * n_blocks
-        group_id = pid // num_pid_in_group
-        pid_in_group = pid % num_pid_in_group
-        first_pid_m = group_id * GROUP_M
-        remaining_m = num_pid_m - first_pid_m
-        group_size_m = arith.select(remaining_m < GROUP_M, remaining_m, fx.Int32(GROUP_M))
-        block_m = first_pid_m + (pid_in_group % group_size_m)
-        block_n = pid_in_group // group_size_m
+        block_m, block_n = block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
         # i64 input re-base. A[M,K]: fold row base (m_row*K) into SRD. B[K,N]: the
         # k*BLOCK_K*c_n contraction is i64 per load (cn_i), capped at 4GB by num_records.
@@ -530,8 +582,19 @@ def _compile_dense_nn(
             wave_n, N_TILES_B, 32, inline_asm=b_inline_asm_load, vmcnt_hint=vmcnt_hint, wswz=_nnwz
         )
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPerTensor(
-            A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty, store_aux=_CSTORE_AUX
+        _store_cls = StoreCPerTensorPairN if pair_n else StoreCPerTensor
+        store_c = _store_cls(
+            A_scale,
+            B_scale,
+            C,
+            c_m,
+            c_n,
+            mfma.idx,
+            N_TILES_A,
+            N_TILES_B,
+            _out_ty,
+            col_safe=col_safe,
+            store_aux=_CSTORE_AUX,
         )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -560,7 +623,8 @@ def _compile_dense_nn(
         # all are load-bearing — dropping any risks a compiler-reorder race.
         # vmcnt=-1: the trailing wait_barrier already drains g2s (the epilogue keeps its own).
         for k in range_constexpr(K_ITERS - 2):
-            b0_frag = b_s2r.load(b_cur0, vmcnt=-1)
+            # drain=False: the a0 load drains these reads before c00 consumes b0.
+            b0_frag = b_s2r.load(b_cur0, vmcnt=-1, drain=False)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
             rocdl.s_barrier()
@@ -595,7 +659,6 @@ def _compile_dense_nn(
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
-
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
@@ -642,6 +705,11 @@ def _compile_dense_nn(
         b_cur0, b_next0 = b_next0, b_cur0
         b_cur1, b_next1 = b_next1, b_cur1
 
+        wave_n_offset = _readfirstlane_i32(wave_n * (N_TILES_B * 16))
+        wave_m_offset = _readfirstlane_i32(wave_m * (N_TILES_A * 16))
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+
         # Epilog 2 -- K-tail block. Mask A so K-cols >= K_TAIL contribute 0.
         a0_frag = a_s2r.load(a_cur0)
         a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
@@ -652,6 +720,9 @@ def _compile_dense_nn(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
+        # Issue each group at its own last mfma: the exposed drain is the burst's tail.
+        store_c.store(c00_frag, base_row, base_col)
+
         b1_frag = b_s2r.load(b_cur1)
         rocdl.s_barrier()
 
@@ -659,6 +730,8 @@ def _compile_dense_nn(
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
+
+        store_c.store(c01_frag, base_row, base_col + LDS_BLOCK_N)
 
         a1_frag = a_s2r.load(a_cur1)
         a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
@@ -670,14 +743,7 @@ def _compile_dense_nn(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        wave_n_offset = wave_n * (N_TILES_B * 16)
-        wave_m_offset = wave_m * (N_TILES_A * 16)
-        base_row = block_m * BLOCK_M + wave_m_offset
-        base_col = block_n * BLOCK_N + wave_n_offset
-
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col)
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
     @flyc.jit
@@ -1640,12 +1706,15 @@ def _get_compiled_dense(launch, args):
 
 def _pick_dense_candidate(cands, args):
     """Fastest of ``cands`` = [[launch, cfg, compiled], ...], sampled twice with the second
-    pass reversed and kept at its min: the leading candidates sit closer together than one
-    sample's spread, so a single pass would rank them by clock drift."""
+    pass reversed and kept at its min, behind a throwaway pass: the leading candidates sit
+    closer than one sample's spread, so otherwise clock drift and warm-up do the ranking."""
+    for _ in range(_PICK_RAMP_ITERS):
+        cands[0][2](*args)
+    torch.cuda.synchronize()
     order = list(range(len(cands)))
     ts = [float("inf")] * len(cands)
     for i in order + order[::-1]:
-        ts[i] = min(ts[i], _robust_time(cands[i][2], args, warmup=2, reps=1, iters=20))
+        ts[i] = min(ts[i], _robust_time(cands[i][2], args, warmup=2, reps=2, iters=40))
     return cands[min(order, key=ts.__getitem__)]
 
 
@@ -1677,10 +1746,16 @@ def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
     return scale.to(dtype=torch.float32, device=device).reshape(1)
 
 
-# NN autotune candidates (BLOCK_M, GROUP_M, num_xcd, AGPR): only BLOCK_M is raced, AGPR != 0.
+# Wide and narrow grids want opposite bands over B's N-stripe, so both are raced.
 _NN_CANDIDATES = [
-    (256, 4, 8, 32),
-    (128, 4, 8, 48),
+    (256, 4, 0, 8, 32),
+    (256, 4, 0, 1, 32),
+    (256, 2, 0, 2, 32),
+    (256, 1, 0, 4, 32),
+    (128, 4, 0, 8, 48),
+    (256, 4, 4, 8, 32),
+    (256, 4, 2, 8, 32),
+    (256, 8, 4, 8, 32),
 ]
 _NN_AUTOTUNE_CACHE: dict = {}
 
@@ -1696,7 +1771,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
         return _NN_AUTOTUNE_CACHE[key]
     out_view = args[2]
     cands = []
-    for bm, gm, xcd, ag in _NN_CANDIDATES:
+    for bm, gm, gn, xcd, ag in _NN_CANDIDATES:
         # odd-M (M % bm != 0) is fine: the partial last M-tile is
         # bounded by c_m (StoreCPerTensor clamp) and the global SRD (HW OOB
         # clamp on the A G2S load), so no even-tiling filter is needed.
@@ -1708,6 +1783,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
                 BLOCK_M=bm,
                 BLOCK_N=256,
                 GROUP_M=gm,
+                group_n=gn,
                 num_xcd=xcd,
                 agpr_alloc=ag,
                 b_inline_asm_load=True,
@@ -1716,6 +1792,8 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
                 blgp=blgp,
                 out_fp16=out_fp16,
                 i64_traverse=i64_traverse,
+                pair_n=N % 2 == 0 and not out_fp16,
+                col_safe=N % 256 == 0,
             )
             c = _get_compiled_dense(launch, args)
             c(*args)
@@ -1723,7 +1801,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
             sample = out_view.view(-1)[:1024].float()
             if not _torch.isfinite(sample).all().item():
                 continue
-            cands.append([launch, (bm, gm, xcd, ag), c])  # c: compiled, reused eager
+            cands.append([launch, (bm, gm, gn, xcd, ag), c])  # c: compiled, reused eager
         except Exception:
             continue
     if not cands:
