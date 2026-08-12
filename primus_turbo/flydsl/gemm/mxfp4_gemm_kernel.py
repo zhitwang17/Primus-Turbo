@@ -445,17 +445,19 @@ class MfmaScaleFp4:
         ki=None,
         sc_buf_stride=0,
         half_n=None,
+        half_g2s=True,
         half_k=False,
         split=None,
         cst=None,
         cst_gap=0,
         cst_ilv=0,
+        cst_nt=False,
         b_base_even=None,
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm K-loop: one inline-asm hw-loop, unroll-2 ping-pong with
-        VGPR-direct or COOP scales. half_n/half_k/split/cst select boundary/odd-K/
-        parity-split/fused-store variants; returns (accL, accR)."""
+        VGPR-direct or COOP scales. half_n/half_k/split/cst/half_g2s select boundary/odd-K/
+        parity-split/fused-store/live-R-half variants; returns (accL, accR)."""
         assert self.packed
         nta, ntb = self.n_tiles_a, self.n_tiles_b
         nq = nta * ntb
@@ -491,11 +493,13 @@ class MfmaScaleFp4:
             _TACC,
             ki,
             half_n is not None,
+            half_g2s,
             half_k,
             split is not None and len(split[0]),
             cst is not None,
             cst_gap,
             cst_ilv,
+            cst_nt,
         )
         _SPLIT = split is not None
         _CST = cst is not None
@@ -763,6 +767,10 @@ class MfmaScaleFp4:
                     ls.append(f"v_add_u32 ${r[e]}, ${i_crb}, ${r[e - 1]}")
                 return ls
 
+            # C is write-only, so under a large output it evicts the operand lines it shares L2
+            # with. ``nt`` marks the store's lines evict-first and keeps the operands resident.
+            _CNT = " nt" if cst_nt else ""
+
             def cst_group(ii, sl, ji, p):
                 # bf16 is the accumulator's high half, so the store sources the AGPR directly.
                 q = sl * nq + ii * ntb + ji
@@ -771,6 +779,7 @@ class MfmaScaleFp4:
                 return [
                     f"buffer_store_short_d16_hi a{4 * q + e}, ${o_crw[p][e]}, ${rs}, 0 offen"
                     + (f" offset:{imm}" if imm else "")
+                    + _CNT
                     for e in range(4)
                 ]
 
@@ -797,6 +806,7 @@ class MfmaScaleFp4:
                     ls.append(
                         f"buffer_store_dwordx2 v[{d}:{d + 1}], ${o_crw[p][e]}, ${rs}, 0 offen"
                         + (f" offset:{imm}" if imm else "")
+                        + _CNT
                     )
                 return ls
 
@@ -936,6 +946,8 @@ class MfmaScaleFp4:
                     gi += 1
                 if refill:
                     for tt in range(t_a, NT + set_sz):  # end drain: refill still-pending temps
+                        if half and t_br <= tt < t_sc:
+                            continue  # R half: the variant never reads these fragments
                         if tt not in refilled:
                             out.append(ds_line(nxt_buf, tt))
                 if cstq is not None:
@@ -1070,7 +1082,7 @@ class MfmaScaleFp4:
                         _scA = emit_sc_coop_g2s(0) + emit_sc_coop_ds(nsct, 1)
                     else:
                         _scA = emit_sc_vgpr(nsct)
-                    _gA = emit_g2s(0, o_sa, o_sbl, o_sbr, half)
+                    _gA = emit_g2s(0, o_sa, o_sbl, o_sbr, half and half_g2s)
                     if _ROT:  # rotate first (phase A's own g2s dest is the new head)
                         _gA = emit_rot() + mix_g2s(_gA, emit_bases(0))
                     return _scA + emit_inplace(1, _gA, half) + _scv_adv()
@@ -1088,7 +1100,7 @@ class MfmaScaleFp4:
                         _scB = emit_sc_coop_g2s(1) + emit_sc_coop_ds(0, 0)
                     else:
                         _scB = emit_sc_vgpr(0)
-                    _gB = emit_g2s(1, o_ta, o_tbl, o_tbr, half)
+                    _gB = emit_g2s(1, o_ta, o_tbl, o_tbr, half and half_g2s)
                     if _ROT:
                         _gB = mix_g2s(_gB, emit_bases(1))
                     B += _scB + emit_inplace(0, _gB, half)
