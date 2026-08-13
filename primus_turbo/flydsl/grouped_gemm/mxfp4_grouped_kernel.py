@@ -537,6 +537,9 @@ _GMXFP4_NT_CFG = (4, 8, 0, 16, False)
 _GMXFP4_NT_CFG_THIN = (4, 8, 0, 16, True)
 _GMXFP4_WGRAD_CFG = (2, 1, 4, False, 1, False)
 _GMXFP4_WGRAD_CFG_SHORT = (4, 1, 6, True, 2, True)  # short per-group contraction: see selector
+# A group whose tiles outnumber the CUs keeps the machine inside that one group for a stretch,
+# so the band shape alone decides which operand rows stay resident: narrower M, wider N.
+_GMXFP4_WGRAD_CFG_SHORT_SPAN = (2, 1, 8, True, 2, True)
 _GMXFP4_WGRAD_SHORT_MG = 8192  # per-group contraction at/below which the short-M blocking applies
 _GMXFP4_CACHE_CAP = 32  # drop caches past this; real MoE uses few shapes, a test sweep many
 _N_CU = 256  # gfx950 compute units, i.e. the width of one dispatch generation
@@ -749,9 +752,10 @@ def _build_grouped_mxfp4_wgrad_kernel(
     _BILV = N_TILES_BH if (_CSTORE and LDS_ROW_STRIDE == 128 and N_TILES_BH == 4) else 0
     TOTAL = G * TILES_PER_GROUP
     # One WG walks WGT tiles from opposite ends of the tile stream, levelling per-WG work and
-    # amortizing the per-WG fixed cost -- but only for a group whose tiles fit one dispatch
-    # generation, where the longest tile is otherwise a pure exposed tail.
-    _WGT = wg_tiles if (wg_tiles > 1 and TOTAL % wg_tiles == 0 and TILES_PER_GROUP <= _N_CU) else 1
+    # amortizing the per-WG fixed cost. Both hold however many generations a group spans, so the
+    # gate is the paired grid's width: pairing backfires only once the halved grid stops covering
+    # one generation, where levelling has no parallel work left to hide the longer chain.
+    _WGT = wg_tiles if (wg_tiles > 1 and TOTAL % wg_tiles == 0 and TOTAL // wg_tiles >= _N_CU) else 1
     GRID = TOTAL // _WGT
 
     _anns = {f"A_lds{i}": fx.Array[fx.Float8E4M3FN, a_lds_size, 16] for i in range_constexpr(NABUF)}
@@ -1051,11 +1055,17 @@ def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
     return e
 
 
-def _select_gmxfp4_wgrad_cfg(M_total, G):
+def _select_gmxfp4_wgrad_cfg(M_total, G, OUT_M=0, OUT_N=0):
     """Pick the wgrad tile blocking from the mean per-group contraction. A short contraction
     writes G x more C for the same FLOP, saturating the store enough to evict the operand slabs
-    it shares L2 with -- non-temporal buys those hits back; a long contraction writes too little."""
-    return _GMXFP4_WGRAD_CFG_SHORT if M_total // max(G, 1) <= _GMXFP4_WGRAD_SHORT_MG else _GMXFP4_WGRAD_CFG
+    it shares L2 with -- non-temporal buys those hits back; a long contraction writes too little.
+    The short arm splits again on the per-group tile count: past one CU's worth the machine sits
+    inside a single group, so its own operand rows must stay resident and the wide band wins."""
+    if M_total // max(G, 1) > _GMXFP4_WGRAD_SHORT_MG:
+        return _GMXFP4_WGRAD_CFG
+    if ceildiv(OUT_M, _BLOCK) * ceildiv(OUT_N, _BLOCK) > _N_CU:
+        return _GMXFP4_WGRAD_CFG_SHORT_SPAN
+    return _GMXFP4_WGRAD_CFG_SHORT
 
 
 def _compile_grouped_mxfp4_wgrad_fused(
@@ -1159,6 +1169,6 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             _GMXFP4_WGRAD_AT_CACHE[atk] = e2
         return e2
 
-    run_eager_or_capture(_entry(_select_gmxfp4_wgrad_cfg(M_total, G)), args, 1)
+    run_eager_or_capture(_entry(_select_gmxfp4_wgrad_cfg(M_total, G, OUT_M, OUT_N)), args, 1)
     _bound_caches(_GMXFP4_WGRAD_LAUNCH_CACHE, _GMXFP4_WGRAD_AT_CACHE, _GMXFP4_WGRAD_WS_CACHE)
     return out
