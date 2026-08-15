@@ -64,20 +64,17 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         scale_inv = 1.0f / scale;
     } else {
         // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale.
-        auto          amax      = torch::empty({}, input.options().dtype(at::kFloat));
-        const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(1, input.numel());
-        auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
+        auto        amax      = torch::empty({}, input.options().dtype(at::kFloat));
+        auto        workspace = torch::empty({tensorwise_amax_workspace_elems()},
+                                             input.options().dtype(at::kFloat));
+        const float fp8_max   = get_float8_max(dest_dtype);
         TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
-            reduce_row<InT, float, float>(
-                PrimusTurboReduceOp::REDUCE_ABS_MAX, reinterpret_cast<InT *>(input.data_ptr()),
-                amax.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
+            quantize_tensorwise_amax_scale_impl<InT>(
+                reinterpret_cast<const InT *>(input.data_ptr()), input.numel(), fp8_max,
+                amax.data_ptr<float>(), reinterpret_cast<float *>(scale.data_ptr()),
+                reinterpret_cast<float *>(scale_inv.data_ptr()),
+                workspace.data_ptr<float>(), stream);
         });
-
-        const float fp8_max = get_float8_max(dest_dtype);
-        compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()), fp8_max,
-                                       reinterpret_cast<float *>(scale.data_ptr()),
-                                       reinterpret_cast<float *>(scale_inv.data_ptr()),
-                                       amax.numel(), stream);
     }
 
     // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
