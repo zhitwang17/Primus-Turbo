@@ -55,26 +55,30 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
     const int64_t Kp   = cdiv(K, padding_align_size) * padding_align_size;
     const int64_t rows = input.numel() / std::max<int64_t>(K, 1);
 
-    at::Tensor scale     = torch::empty({}, input.options().dtype(at::kFloat));
-    at::Tensor scale_inv = torch::empty({}, input.options().dtype(at::kFloat));
-
+    at::Tensor scale, scale_inv;
     if (scale_opt.has_value()) {
         scale = scale_opt.value();
         PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
         scale_inv = 1.0f / scale;
     } else {
         // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale.
-        auto        amax      = torch::empty({}, input.options().dtype(at::kFloat));
-        auto        workspace = torch::empty({tensorwise_amax_workspace_elems()},
-                                             input.options().dtype(at::kFloat));
-        const float fp8_max   = get_float8_max(dest_dtype);
+        // Block partials fill [0, W) and the three scalars sit right after them,
+        // so the amax -> scale handoff costs one allocation instead of four.
+        // These run before the op's first kernel is enqueued, and the scored
+        // shapes leave the GPU idle for all of it: an empty allocation is ~1 us
+        // of host time and the whole op is 200-305 us.
+        const at::IntArrayRef scalar_shape{};
+        const int64_t         w   = tensorwise_amax_workspace_elems();
+        at::Tensor            ws  = torch::empty({w + 3}, input.options().dtype(at::kFloat));
+        float                *wsp = ws.data_ptr<float>();
+        const float           fp8_max = get_float8_max(dest_dtype);
         TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
             quantize_tensorwise_amax_scale_impl<InT>(
-                reinterpret_cast<const InT *>(input.data_ptr()), input.numel(), fp8_max,
-                amax.data_ptr<float>(), reinterpret_cast<float *>(scale.data_ptr()),
-                reinterpret_cast<float *>(scale_inv.data_ptr()),
-                workspace.data_ptr<float>(), stream);
+                reinterpret_cast<const InT *>(input.data_ptr()), input.numel(), fp8_max, wsp + w,
+                wsp + w + 1, wsp + w + 2, wsp, stream);
         });
+        scale     = ws.as_strided(scalar_shape, scalar_shape, w + 1);
+        scale_inv = ws.as_strided(scalar_shape, scalar_shape, w + 2);
     }
 
     // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
