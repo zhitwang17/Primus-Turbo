@@ -281,13 +281,40 @@ constexpr float   AMAX_SCALE_EPS  = 1e-12f;
 // Geometry around this point, in us on the two shapes above, deployed first:
 //   block/unroll  <1024,2> 76.4/107.6  <1024,4> 77.5/107.9  <1024,1> 78.6/110.0
 //                 <512,4>  79.1/111.6  <256,2>  79.4/113.0  <256,8>  81.3/112.5
-//   grid          2048 (deployed)      4096 76.2/107.2      1024 76.7/109.3
-//                 512 80.6/111.3
 //   block reduce  replacing it with a wave reduce and eight times the partials
 //                 saves 0.5/0.1 us here and costs more than that in the pass
 //                 that has to reduce them
-// Nothing outside the noise band, which is what a kernel already running at the
-// platform's pure-read rate should look like. The guard below keeps the loads
+//
+// The grid is the one knob that is not flat in isolation, and it is also the one
+// that does not survive the scored bench. Held at <1024,2>, with every arm proved
+// to cover each 16-byte vector exactly once (a planted unique maximum plus a
+// per-vector hit counter -- an arm that reads half the tensor still returns the
+// right amax, so the value alone proves nothing), median us per shape, measured
+// back to back and again behind a 400 MB dirtying write:
+//   grid   1920/2025 (one tile per block, no ragged final generation) 78.8/112.2
+//          2048 77.9/109.4   3072 77.9/109.8   4096 77.3/109.5
+//          8192 78.0/106.8   16384 92.1/116.7
+// 8192 looks worth 2.4-2.7% on [131072, 2880] and nothing either way on the
+// weight shape, and timing BOTH launches inside one region still says -2.2 us on
+// the activation shape and +0.2 on the weight one. On the scored bench the same
+// change (with the final pass widened to 1024 threads so it keeps eight loads in
+// flight per thread) measured 8.911 against 8.961, i.e. the weight op got 3.5 us
+// SLOWER and the activation op did not move: a partial set four times larger
+// leaves four times as many dirty single-dword lines spread over eight XCDs for
+// one block to collect, and no harness that launches the pair back to back
+// reproduces that. This is the third geometry around this handoff whose isolated
+// gain inverts on the bench (nontemporal stores by output size, a single-wave
+// final pass, and now the partial count), so treat the amax -> scale handoff as
+// bench-only territory. 16384 falls apart everywhere: a block then lives for one
+// 32 KB tile and pays a 16-wave block reduce for it.
+// Two partition shapes that were expected to help do not: giving each block one
+// contiguous slice instead of a strided one is 1.0-2.3% slower (the 2048 streams
+// re-opening a DRAM page every 32 KB are evidently already what the controller
+// wants), and so is the pad kernel's one-tile-per-block shape at grid = work
+// (2.1-4.8% slower). Publishing the partials with __builtin_nontemporal_store is
+// far worse than either: a single 4-byte nontemporal store per block costs 11 to
+// 14 us per pass at grid 2048 and 8192 alike.
+// The guard below keeps the loads
 // serialised (the
 // ISA sinks the second load into the guarded region and reuses the first one's
 // registers, so a wave runs load -> vmcnt(0) -> reduce -> load), and lifting it
@@ -419,8 +446,20 @@ constexpr int32_t PAD_ROW_BLOCK_SIZE = 256;
 // point has been swept, all on the deploy shapes and against the shipped arm:
 //   UNROLL   4 -> 0.82x,  16 -> 0.94x (a padded row holds 184 wide packs, fewer
 //            than one block of threads, so the second half of the block idles)
-//   BLOCK    64 -> 0.96x, 128 -> 0.98x, 512 -> 0.86x
-//   grid     rows/2, /3, /4, /8, /16 and fixed 2048/8192/23040 all <= rows
+//   BLOCK    64 -> 0.96x, 128 -> 0.98x, 192 -> 0.96x, 320 -> 0.90x, 368 -> 0.94x,
+//            384 -> 0.94x, 448 -> 0.92x, 512 -> 0.86x. 256 wins all six cells of
+//            (two shapes x three cache regimes); the ranking is not lane
+//            efficiency -- 384 leaves a row's 368 packs in one pass at 96% lane
+//            use and still loses to 256 running two passes
+//   grid     rows/2, /3, /4, /8, /16 and fixed 2048/8192/23040 all <= rows;
+//            rows/2 is the best of them in isolation (0.996x to 0.87x depending
+//            on what ran before it) and measured 8.841 against 8.961 on the
+//            scored bench, +7.8 us on the activation op alone. Fewer blocks buy
+//            back dispatch this kernel does not spend: an empty launch of this
+//            geometry is 22.4/30.4 us against a 120/172 us kernel, and the ISA
+//            reports 27 VGPRs, no scratch and 8 waves/SIMD, so there is no
+//            occupancy or prologue amortisation left for a shorter grid to win
+//            either -- __launch_bounds__ already has the maximum
 //   loop     splitting the real and pad columns into separate loops 0.997x,
 //            issuing the next pack's load before the current pack's store
 //            (graded vmcnt) 0.993x, flattening 8-64 rows into one exact-length
@@ -436,6 +475,24 @@ constexpr int32_t PAD_ROW_BLOCK_SIZE = 256;
 // 1% once the harness stops evicting the output buffer, but it still mis-ranks
 // CHANGES to that write stream by several percent in either direction, so only
 // the scored bench decides here.
+//
+// What the kernel is actually paying, from running this exact body with one half
+// of its memory stream deleted (same grid, same block, same loop):
+//   loads only   531 MB in 73.6 us = 7.22 TB/s   755 MB in 103.0 us = 7.33 TB/s
+//   stores only  271 MB in 37.4 us = 7.24 TB/s   386 MB in  50.3 us = 7.68 TB/s
+//   both (this kernel)  802 MB in 119.7 us = 6.70   1141 MB in 167.5 us = 6.81
+// So each direction on its own runs at 7.2-7.7 TB/s and mixing them 2R:1W costs
+// 8-10% against the sum of the halves, which is ~9 us on the weight op and ~16 us
+// on each activation op. That mix penalty, not the rate of either stream, is the
+// largest measured thing left in this kernel. Coarsening the alternation is the
+// obvious attack and the two forms of it available to one block both lose (all
+// loads of a row before all stores 0.95x, next load issued before the current
+// store 0.993x), and so does thinning the concurrent stream count via the grid,
+// so the next thing to try is the one this file cannot reach alone: the store
+// stream is also 25-30% cheaper when it starts against clean lines (the numbers
+// above) than behind whatever dirty lines the previous op left, which prices a
+// producer that hands this kernel a clean cache rather than a geometry change
+// here.
 constexpr int64_t PAD_MAX_BLOCKS = 1 << 20;
 
 // Row-per-block quantize + K-pad. `row` comes from the block id, so both row
