@@ -51,12 +51,15 @@ def quantize_fp8_tensorwise_impl(
 
 
 def quantize_fp8_tensorwise_pad_impl(
-    x: torch.Tensor, out_dtype: torch.dtype
+    x: torch.Tensor, out_dtype: torch.dtype, pad_n: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 cast + K-pad to Kp=ceil128(K) (padding=128, the merged op default).
     Real data in [..., :K], pad columns zeroed. Any ndim >= 1 ([B, N, K] weight in one launch)."""
     x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None, 128)
+    pad_n_align = 128 if pad_n else 1
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
+        x, out_dtype, None, 128, pad_n_align
+    )
     return x_fp8, scale_inv
 
 

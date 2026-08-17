@@ -42,7 +42,8 @@ inline bool is_torch_fp8(const at::ScalarType dtype) {
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
                                                 c10::optional<at::Tensor> scale_opt,
-                                                const int64_t             padding_align_size) {
+                                                const int64_t             padding_align_size,
+                                                const int64_t pad_penultimate_align_size) {
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
@@ -68,9 +69,9 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         // shapes leave the GPU idle for all of it: an empty allocation is ~1 us
         // of host time and the whole op is 200-305 us.
         const at::IntArrayRef scalar_shape{};
-        const int64_t         w   = tensorwise_amax_workspace_elems();
-        at::Tensor            ws  = torch::empty({w + 3}, input.options().dtype(at::kFloat));
-        float                *wsp = ws.data_ptr<float>();
+        const int64_t         w       = tensorwise_amax_workspace_elems();
+        at::Tensor            ws      = torch::empty({w + 3}, input.options().dtype(at::kFloat));
+        float                *wsp     = ws.data_ptr<float>();
         const float           fp8_max = get_float8_max(dest_dtype);
         TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
             quantize_tensorwise_amax_scale_impl<InT>(
@@ -83,7 +84,20 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
 
     // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
     std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
-    out_shape.back()  = Kp;
+    out_shape.back() = Kp;
+    // Optional padN: also pad the penultimate dim N -> Np (pad rows are zeroed by
+    // the kernel). Feeds the grouped GEMM a fully 128-aligned weight [G, Np, Kp];
+    // amax/scale are unchanged (over the real data) so the numerics are identical.
+    int64_t n_pen = 0, np_pen = 0;
+    if (pad_penultimate_align_size > 1 && input.dim() >= 2) {
+        const int64_t N  = input.size(-2);
+        const int64_t Np = cdiv(N, pad_penultimate_align_size) * pad_penultimate_align_size;
+        if (Np > N) {
+            n_pen                           = N;
+            np_pen                          = Np;
+            out_shape[out_shape.size() - 2] = Np;
+        }
+    }
     at::Tensor output = torch::empty(out_shape, torch::dtype(dest_dtype).device(input.device()));
 
     TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
@@ -91,7 +105,7 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
             quantize_tensorwise_pad_impl<FType, QType>(
                 reinterpret_cast<const FType *>(input.data_ptr()),
                 reinterpret_cast<const float *>(scale.data_ptr()),
-                reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream);
+                reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream, n_pen, np_pen);
         });
     });
 

@@ -433,8 +433,13 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
             go = group_offs if group_offs is not None else group_offs_from_lens(group_lens)
             fp8_dtype = _get_fp8_dtype(config.format, True)
+            # padN: cast-and-pad the weight's HIDDEN=N (penultimate) dim to Np=ceil128(N) as
+            # well, so the GEMM sees a fully 128-aligned [G, Np, Kp] weight. The pad rows are
+            # exact zero (fused in the quant kernel), so out[:, N:Np] come out zero and are
+            # sliced off; the dgrad NN contraction over N stays exact (0*anything=0).
+            n_real = b.shape[1]  # HIDDEN before padN
             a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
-            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype)  # [G, N, Kp]
+            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype, pad_n=True)  # [G, Np, Kp]
             out = grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 a_q,
                 b_q,
@@ -444,7 +449,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 trans_b=True,
                 out_dtype=out_dtype,
                 num_cu=(num_cu if num_cu is not None else -1),
-            )
+            )  # [M, Np]
+            out = out[:, :n_real].contiguous()  # [M, N]
             ctx.save_for_backward(a_q, b_q, a_sc, b_sc, group_lens, go)
             ctx.trans_a = False
             ctx.trans_b = trans_b
@@ -452,6 +458,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             ctx.out_dtype = out_dtype
             ctx.num_cu = num_cu
             ctx.k_pad_real = a.shape[-1]
+            ctx.n_pad_real = n_real
             return out
 
         if isinstance(a, QuantizedTensor):
@@ -521,6 +528,16 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
         k_pad_real = getattr(ctx, "k_pad_real", None)
+        n_pad_real = getattr(ctx, "n_pad_real", None)
+
+        # padN: the saved weight b_fp8 is [G, Np, Kp] (HIDDEN padded to Np). dgrad NN contracts
+        # grad_out's last dim against b_fp8's penultimate dim, so grad_out must be widened N->Np.
+        # The pad columns are zero (and b's pad rows are exact zero), so the extra contractions add
+        # exact 0 -> grad_a is unchanged; grad_b picks up Np rows that are sliced back to N.
+        if n_pad_real is not None:
+            np_dim = b_fp8.shape[-2]
+            if grad_out.shape[-1] < np_dim:
+                grad_out = torch.nn.functional.pad(grad_out, (0, np_dim - grad_out.shape[-1])).contiguous()
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         quantized_grad_out = QuantizedTensor.quantize(
@@ -565,7 +582,11 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         if k_pad_real is not None:
             grad_a = grad_a[:, :k_pad_real].contiguous()
-            grad_b = grad_b[..., :k_pad_real].contiguous()
+            if n_pad_real is not None:
+                # grad_b is [G, Np, Kp]; slice back to real [G, N, K].
+                grad_b = grad_b[:, :n_pad_real, :k_pad_real].contiguous()
+            else:
+                grad_b = grad_b[..., :k_pad_real].contiguous()
 
         return (
             grad_a,  # a
