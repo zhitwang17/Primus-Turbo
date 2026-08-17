@@ -38,7 +38,7 @@ K-tail / barrier rationale (identical here).
 """
 
 import functools
-import os
+import warnings
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -302,9 +302,8 @@ def _compile_grouped_nn(
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-            _nnwz = os.environ.get("PT_NN_WSWZ", "1") == "1"  # wave-swizzle dgrad B, default on
             gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=_nnwz)
+            gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=True)
 
             # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
             mfma = _build_mfma(
@@ -325,7 +324,7 @@ def _compile_grouped_nn(
             # wave-coop transpose reads from the backend so it keeps load/mfma overlap
             # (the intrinsic would force a vmcnt(0) drain). Inline path needs agpr_alloc>0.
             b_s2r = S2RLoaderTr(
-                wave_n, N_TILES_B, 32, inline_asm=(agpr_inplace and acc_mode == "agpr"), wswz=_nnwz
+                wave_n, N_TILES_B, 32, inline_asm=(agpr_inplace and acc_mode == "agpr"), wswz=True
             )
             if const_expr(store_cshuffle):
                 store_c = StoreCPerTensorCShuffle(
@@ -1614,8 +1613,8 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
     # Race one 4-wave (occ=1) candidate against the 8-wave winner, dgrad (NN) only (fwd
     # NT 4-wave never wins). Config is a fixed rule on K, not a sweep: large-K -> xcd1
     # group-major, else xcd8. Keeps NN at 3 8-wave + 1 4-wave = 4 candidates. Any K (the
-    # group-bounded B SRD zeros the K%128 tail); PT_NO_G4W=1 disables.
-    if (not trans_b) and os.environ.get("PT_NO_G4W", "0") != "1":
+    # group-bounded B SRD zeros the K%128 tail).
+    if not trans_b:
         xcd4, gm4, gn4, vm4h = (1, 4, 8, 2) if K >= _NP_LARGE_K else (8, 4, 0, 2)
         try:
             l4 = _compile_grouped_nn_4wave(
@@ -1630,13 +1629,10 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
                 vmcnt_hint=vm4h,
             )
         except Exception as _e4w:
-            if os.environ.get("PT_QUIET_G4W", "0") != "1":
-                import warnings as _warnings_g4w
-
-                _warnings_g4w.warn(
-                    f"4-wave joint candidate compile failed (trans_b={trans_b}, K={K}, G={G}, "
-                    f"xcd={xcd4}, gm={gm4}, gn={gn4}): {_e4w!r}"
-                )
+            warnings.warn(
+                f"4-wave joint candidate compile failed (trans_b={trans_b}, K={K}, G={G}, "
+                f"xcd={xcd4}, gm={gm4}, gn={gn4}): {_e4w!r}"
+            )
             l4 = None
         if l4 is not None:
             s = _score(l4)
@@ -2125,9 +2121,9 @@ def _compile_grouped_tn_wgrad_persistent(
 
 # 3-buffer whole-loop: one pool gets prefetch depth 3, the rest depth 2. n_phases =
 # lcm(nbuf per pool), statically unrolled so each pool's write/refill buf index is a
-# compile-time constant per phase. PT_WL_VMCNT_MODE="partial" (default) skips the next
-# barrier's drain for the 3-buf pool's just-issued write, relying on buffer_load_lds FIFO
-# order -- verify with a bit-exact repeated-run race test, SNR alone won't catch it.
+# compile-time constant per phase. The partial drain skips the next barrier's drain for
+# the 3-buf pool's just-issued write, relying on buffer_load_lds FIFO order -- verify with
+# a bit-exact repeated-run race test, SNR alone won't catch it.
 _WL_ASM_CACHE_3BUF = {}
 
 
@@ -2169,10 +2165,9 @@ def _wholeloop_asm_3buf(
     nbuf_p = tuple(len(bases[p]) for p in range(4))
     n_phases = reduce(lambda a, b: a * b // gcd(a, b), nbuf_p, 1)
     mods = f" cbsz:{cbsz} blgp:{blgp}" if (cbsz or blgp) else ""
-    _vmcnt_mode = os.environ.get("PT_WL_VMCNT_MODE", "partial")  # partial-drain is the default
     _has_tail = tail_nval is not None
     _cs_t = tuple(cs) if isinstance(cs, (list, tuple)) else (cs, cs, cs, cs)
-    key = ("3buf", nta, ntb, nsa, nsb, nbuf_p, mods, rs, _cs_t, nw, _vmcnt_mode, _has_tail, a_plain)
+    key = ("3buf", nta, ntb, nsa, nsb, nbuf_p, mods, rs, _cs_t, nw, _has_tail, a_plain)
     if key not in _WL_ASM_CACHE_3BUF:
         o_acc = list(range(NT))
         t_pool = [NT]
@@ -2320,7 +2315,7 @@ def _wholeloop_asm_3buf(
 
         _3buf_pools = [p for p in range(4) if nbuf_p[p] == 3]
         _3buf_pool = _3buf_pools[0] if _3buf_pools else None
-        if _vmcnt_mode == "partial" and _3buf_pool is not None:
+        if _3buf_pool is not None:
             # Partial drain keeps ALL 3-buffered pools' writes in flight; emit order
             # (0,1,2,3) issues them last so vmcnt(sum) leaves exactly those outstanding.
             _n_outstanding = sum((nsa if p < 2 else nsb) for p in _3buf_pools)
@@ -2355,7 +2350,7 @@ def _wholeloop_asm_3buf(
         L.append(f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}")
         L.append("s_cbranch_scc1 1b")
 
-        if _has_tail and _vmcnt_mode == "partial" and _3buf_pool is not None:
+        if _has_tail and _3buf_pool is not None:
             # Full drain before the tail reuses the loop's LDS/regs: partial drain relies
             # on a next phase, which is gone after loop exit. Skipped when tail_nval==0.
             L.append(f"s_cmp_eq_u32 ${i_tailval}, 0")
@@ -2457,8 +2452,7 @@ def _wholeloop_tile_3buf(
     tail_nval=None,  # pass through to _wholeloop_asm_3buf
     a_plain=False,  # see _wholeloop_tile_3buf's a_plain/a_row_stride
     a_row_stride=None,
-    b0_extra_buf=None,  # optional 3rd buffer for pool2 (B0), giving both B pools 3-deep
-    # buffering instead of just pool3 (B1). None = 1-pool-3buf behavior.
+    b0_extra_buf,  # pool2 (B0)'s 3rd buffer, so both B pools are 3-deep, not just pool3
 ):
     assert not a_plain or a_row_stride is not None, "a_plain=True requires a_row_stride"
     a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
@@ -2477,7 +2471,7 @@ def _wholeloop_tile_3buf(
     A_K_STEP = arith.index(block_k) * cm_i
     B_K_STEP = arith.index(block_k) * cn_i
 
-    # Prologue: pools 0-2 prime 2 K-blocks (cur,next); pool3 (B1) primes 3 (cur,next,extra).
+    # Prologue: the A pools prime 2 K-blocks (cur,next); both B pools prime 3 (cur,next,extra).
     a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
     b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
     b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
@@ -2487,16 +2481,14 @@ def _wholeloop_tile_3buf(
     b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
     a_g2s.load(a_next1, A1_gl_offset + 1 * A_K_STEP)
     b_g2s.load(b_extra1, B1_gl_offset + 2 * B_K_STEP)  # pool3's 3rd prime (K-block 2)
-    if b0_extra_buf is not None:
-        b_g2s.load(b0_extra_buf, B0_gl_offset + 2 * B_K_STEP)  # pool2's 3rd prime
+    b_g2s.load(b0_extra_buf, B0_gl_offset + 2 * B_K_STEP)  # pool2's 3rd prime
     wait_barrier(0)
 
     # pools[p] = (buf_tuple, s2r); 3buf pools' buf_tuple has 3 entries, others 2.
-    pool2_bufs = (b_cur0, b_next0) if b0_extra_buf is None else (b_cur0, b_next0, b0_extra_buf)
     pools = [
         ((a_cur0, a_next0), a_s2r),
         ((a_cur1, a_next1), a_s2r),
-        (pool2_bufs, b_s2r),
+        ((b_cur0, b_next0, b0_extra_buf), b_s2r),
         ((b_cur1, b_next1, b_extra1), b_s2r),
     ]
     bases = [
@@ -2523,15 +2515,13 @@ def _wholeloop_tile_3buf(
     kstep_a = rocdl.readfirstlane(T.i32, fx.Int32(block_k) * c_m)
     kstep_b = rocdl.readfirstlane(T.i32, fx.Int32(block_k) * c_n)
     # soff0[p] = the gmem offset for the FIRST in-loop write, targeting K-block nbuf[p]
-    # (2 for pools 0-2, 3 for pool3 -- matches W(0)=nbuf[p] in the asm's schedule).
+    # (2 for the A pools, 3 for both B pools -- matches W(0)=nbuf[p] in the asm's schedule).
     soff0_a = [
         rocdl.readfirstlane(T.i32, fx.Int32(A0_gl_offset) + fx.Int32(2) * kstep_a),
         rocdl.readfirstlane(T.i32, fx.Int32(A1_gl_offset) + fx.Int32(2) * kstep_a),
     ]
     soff0_b = [
-        rocdl.readfirstlane(
-            T.i32, fx.Int32(B0_gl_offset) + fx.Int32(3 if b0_extra_buf is not None else 2) * kstep_b
-        ),
+        rocdl.readfirstlane(T.i32, fx.Int32(B0_gl_offset) + fx.Int32(3) * kstep_b),
         rocdl.readfirstlane(T.i32, fx.Int32(B1_gl_offset) + fx.Int32(3) * kstep_b),
     ]
     acc0 = [[mfma.zero_value] * n_accums for _ in range_constexpr(4)]
@@ -2658,8 +2648,6 @@ def _wave4_do_tile_tn(
     mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
     mfma._do_mma = lambda _a, _b, _c: asm_mma_do(_a, _b, _c, mode="2", cbsz=cbsz, blgp=blgp)
 
-    # wave bank-swizzle on iff 2-pool (matches gl_off_a/b wswz in the kernel body).
-    _wswz = os.environ.get("PT_WL_2BPOOL", "1") == "1"
     a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_CS)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_CS)
     a_s2r = S2RLoaderTr(
@@ -2671,7 +2659,7 @@ def _wave4_do_tile_tn(
         n_waves=N_WAVES,
         chunk_stride=_CS,
         width=LDS_BLOCK_M,
-        wswz=_wswz,
+        wswz=True,
     )
     b_s2r = S2RLoaderTr(
         wave_n,
@@ -2682,7 +2670,7 @@ def _wave4_do_tile_tn(
         n_waves=N_WAVES,
         chunk_stride=_CS,
         width=LDS_BLOCK_N,
-        wswz=_wswz,
+        wswz=True,
     )
 
     if const_expr(not epi_cshuffle):
@@ -2749,13 +2737,12 @@ def _wave4_do_tile_tn(
         lds_block_n=LDS_BLOCK_N,
     )
 
-    _b0x = lds.B_lds_extra_0 if os.environ.get("PT_WL_2BPOOL", "1") == "1" else None
     _wholeloop_tile_3buf(
         **_common,
         nval=nval_main,
         do_store=True,
         tail_nval=tail_k_u,
-        b0_extra_buf=_b0x,
+        b0_extra_buf=lds.B_lds_extra_0,
     )
     if const_expr(epi_lds_fence):
         # c_lds aliases a loop buffer; fence before the next tile's prologue refills it.
@@ -2846,17 +2833,13 @@ def _compile_grouped_tn_wgrad_4wave(
     whole-loop bare-asm body: runtime nval (floored to x6) + in-asm fused tail; partial
     K-blocks zeroed by per-group SRD num_records clamp. C=[G*OUT_M, OUT_N]."""
 
-    # 2-pool (both B pools 3-buffered) is default-on; needs _CS=1024 (fit 10 buffers)
-    # + scalar store. PT_WL_2BPOOL=0 falls back to 1-pool @1056.
-    _2BPOOL = os.environ.get("PT_WL_2BPOOL", "1") == "1"
     BLOCK_K = 128
     # BLOCK_N=128 is not supported: ds_read_b64_tr_b8's hardware transpose semantics at
     # that width produce a wrong (but finite) result despite the addressing plumbing
     # below being width-parameterized. Keep this assert at 256.
     assert BLOCK_M == 256 and BLOCK_N == 256, "4-wave grouped wgrad is 256x256-only"
     assert G >= 1
-    # 2-pool needs _CS=1024 (fit 10 buffers); 1-pool/2-buffer keep 1056 (0 bank conflict).
-    _CS = int(os.environ.get("PT_CS", "1024" if _2BPOOL else "1056"))
+    _CS = 1024  # both B pools 3-buffered needs the tighter chunk stride to fit 10 buffers
     # geo.cshuf_n bakes EPI_PAD=4 (row_pad=4 at the StoreCPerTensorCShuffle call sites).
     _geo = _wave4_geometry(
         block_m=BLOCK_M, block_n=BLOCK_N, block_k=BLOCK_K, cs=_CS, csa=_CS, out_fp16=out_fp16
@@ -2879,19 +2862,19 @@ def _compile_grouped_tn_wgrad_4wave(
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
 
-    # 2bpool forces scalar store (no CShuffle) so C_lds_shuffle shrinks to a stub and a
-    # 2nd deferred-write B buffer (B_lds_extra_0) fits (only at _CS=1024 + scalar store).
+    # The scalar store leaves C_lds_shuffle a stub, which is what makes room for the 2nd
+    # deferred-write B buffer (B_lds_extra_0) at _CS=1024.
     SharedStorage = _make_wave4_smem(
         a_lds_size=a_lds_size,
         b_lds_size=b_lds_size,
         cshuf_ty=_cshuf_ty,
-        cshuf_n=(16 if _2BPOOL else _cshuf_n),
-        tail=["C", "B_extra_1"] + (["B_extra_0"] if _2BPOOL else []),
+        cshuf_n=16,
+        tail=["C", "B_extra_1", "B_extra_0"],
     )
-    # beta=1 always takes the CShuffle epilogue.
-    _epi_cshuffle = beta_is_one or not _2BPOOL
-    _epi_alias = _epi_cshuffle and _2BPOOL
-    assert not _epi_alias or a_lds_size >= _cshuf_n * 2, (
+    # beta=1 is the one case that still needs the CShuffle epilogue, so with the stub it
+    # stages over A_lds_cur_0 instead.
+    _epi_cshuffle = beta_is_one
+    assert not _epi_cshuffle or a_lds_size >= _cshuf_n * 2, (
         f"aliased C staging needs {_cshuf_n * 2}B, A_lds_cur_0 holds {a_lds_size}B"
     )
 
@@ -2918,12 +2901,12 @@ def _compile_grouped_tn_wgrad_4wave(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 2
         wave_n = wave_id % 2
-        # wave bank-swizzle on iff 2-pool (write side; matches S2RLoaderTr wswz).
+        # wave bank-swizzle, write side; matches S2RLoaderTr wswz.
         gl_off_a = compute_global_swizzle_nn(
-            lane_id, wave_id, OUT_M, N_LDS_ROUNDS, width=LDS_BLOCK_M, wswz=_2BPOOL
+            lane_id, wave_id, OUT_M, N_LDS_ROUNDS, width=LDS_BLOCK_M, wswz=True
         )
         gl_off_b = compute_global_swizzle_nn(
-            lane_id, wave_id, OUT_N, N_LDS_ROUNDS, width=LDS_BLOCK_N, wswz=_2BPOOL
+            lane_id, wave_id, OUT_N, N_LDS_ROUNDS, width=LDS_BLOCK_N, wswz=True
         )
         _cm = fx.Int32(OUT_M)
         _cn = fx.Int32(OUT_N)
@@ -2974,8 +2957,8 @@ def _compile_grouped_tn_wgrad_4wave(
                 _cn=_cn,
                 beta_is_one=beta_is_one,
                 epi_cshuffle=_epi_cshuffle,
-                c_lds=(lds.A_lds_cur_0 if _epi_alias else lds.C_lds_shuffle),
-                epi_lds_fence=_epi_alias,
+                c_lds=(lds.A_lds_cur_0 if _epi_cshuffle else lds.C_lds_shuffle),
+                epi_lds_fence=_epi_cshuffle,
             )
 
         # Persistent: a fixed grid of <=ncus WGs strides the tile space (scf.for).
