@@ -44,6 +44,14 @@ __all__ = [
     "grouped_gemm_fp8",
 ]
 
+# padN toggle for the tensorwise _kpad path (FP8GroupedGemmTensorFunc).  Deploy default = False
+# = the padK-only incumbent (weight [G, N, Kp], no host un-pad copies).  When True, the weight's
+# HIDDEN=N dim is also padded to Np=ceil128(N) and the outputs are un-padded back to real N.
+# padN is under evaluation (a padN chain campaign): it is only worth enabling if the fully
+# 128-aligned GEMM beats the incumbent AFTER accounting for the un-pad work.  The bench flips
+# this flag to A/B the two chains in one process; do not enable it in deploy until it wins.
+_PADN_ENABLED = False
+
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
     if format == Format.E4M3:
@@ -433,13 +441,16 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
             go = group_offs if group_offs is not None else group_offs_from_lens(group_lens)
             fp8_dtype = _get_fp8_dtype(config.format, True)
-            # padN: cast-and-pad the weight's HIDDEN=N (penultimate) dim to Np=ceil128(N) as
-            # well, so the GEMM sees a fully 128-aligned [G, Np, Kp] weight. The pad rows are
-            # exact zero (fused in the quant kernel), so out[:, N:Np] come out zero and are
-            # sliced off; the dgrad NN contraction over N stays exact (0*anything=0).
+            # padN (opt-in via _PADN_ENABLED; deploy default = OFF = padK incumbent): also
+            # cast-and-pad the weight's HIDDEN=N (penultimate) dim to Np=ceil128(N), so the GEMM
+            # sees a fully 128-aligned [G, Np, Kp] weight. The pad rows are exact zero (fused in
+            # the quant kernel), so out[:, N:Np] come out zero and are sliced off; the dgrad NN
+            # contraction over N stays exact (0*anything=0). The padN branch is the campaign's
+            # optimization target; the padK branch (use_padn=False) is the frozen incumbent.
+            use_padn = _PADN_ENABLED
             n_real = b.shape[1]  # HIDDEN before padN
             a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
-            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype, pad_n=True)  # [G, Np, Kp]
+            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype, pad_n=use_padn)  # [G, (Np|N), Kp]
             out = grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 a_q,
                 b_q,
@@ -449,8 +460,9 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 trans_b=True,
                 out_dtype=out_dtype,
                 num_cu=(num_cu if num_cu is not None else -1),
-            )  # [M, Np]
-            out = out[:, :n_real].contiguous()  # [M, N]
+            )  # [M, Np] if padN else [M, N]
+            if use_padn:
+                out = out[:, :n_real].contiguous()  # [M, N]
             ctx.save_for_backward(a_q, b_q, a_sc, b_sc, group_lens, go)
             ctx.trans_a = False
             ctx.trans_b = trans_b
@@ -458,7 +470,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             ctx.out_dtype = out_dtype
             ctx.num_cu = num_cu
             ctx.k_pad_real = a.shape[-1]
-            ctx.n_pad_real = n_real
+            ctx.n_pad_real = n_real if use_padn else None
             return out
 
         if isinstance(a, QuantizedTensor):
