@@ -931,21 +931,28 @@ static void launch_quantize_tensorwise_pad(const FType *x, QType *y,
 // contraction. amax/scale are unchanged (computed over the real, unpadded data
 // upstream) so the numeric algorithm is untouched -- this is a layout-only pad.
 // ---------------------------------------------------------------------------
+// The group index rides gridDim.y, so a block never derives it from its flat id.
+// The flat form (`g = orow / Np`) put a 64-bit divide and a second 64-bit row
+// multiply in front of every block's first load, and this kernel family is
+// exactly the one that is priced on 64-bit address arithmetic (see the pad_row
+// sweep above: flattening the rows costs 7-11% for reintroducing a per-lane row
+// index). Same block count, same x-major dispatch order, same rows per block.
 template <int BLOCK, int UNROLL, typename FType, typename QType, typename ComputeType>
 __launch_bounds__(BLOCK) __global__
     void quantize_tensorwise_padn_row_kernel(const FType *__restrict__ x, QType *__restrict__ y,
                                              const QuantTensorwiseScalePtrOp<ComputeType> op,
-                                             const int64_t out_rows, const int32_t N,
-                                             const int32_t Np, const int32_t K, const int32_t Kp) {
+                                             const int32_t N, const int32_t Np, const int32_t K,
+                                             const int32_t Kp) {
     const ComputeType scale         = op.scale_ptr[0];
     const uint32_t    k_real        = static_cast<uint32_t>(K);
     const int32_t     packs_per_row = Kp / UNROLL;
-    const int64_t     row_stride    = static_cast<int64_t>(gridDim.x);
+    const int32_t     row_stride    = static_cast<int32_t>(gridDim.x);
+    const int64_t     g             = static_cast<int64_t>(blockIdx.y);
+    QType            *y_grp         = y + g * static_cast<int64_t>(Np) * static_cast<int64_t>(Kp);
+    const FType      *x_grp         = x + g * static_cast<int64_t>(N) * static_cast<int64_t>(K);
 
-    for (int64_t orow = blockIdx.x; orow < out_rows; orow += row_stride) {
-        const int64_t g     = orow / Np;
-        const int32_t local = static_cast<int32_t>(orow - g * static_cast<int64_t>(Np));
-        QType        *yr    = y + orow * static_cast<int64_t>(Kp);
+    for (int32_t local = static_cast<int32_t>(blockIdx.x); local < Np; local += row_stride) {
+        QType *yr = y_grp + static_cast<int64_t>(local) * Kp;
         if (local >= N) {
             // pad row: entire Kp columns are zero.
             for (int32_t p = threadIdx.x; p < packs_per_row; p += BLOCK) {
@@ -953,7 +960,7 @@ __launch_bounds__(BLOCK) __global__
             }
             continue;
         }
-        const FType *xr = x + (g * static_cast<int64_t>(N) + local) * static_cast<int64_t>(K);
+        const FType *xr = x_grp + static_cast<int64_t>(local) * K;
         for (int32_t p = threadIdx.x; p < packs_per_row; p += BLOCK) {
             const uint32_t c = static_cast<uint32_t>(p) * UNROLL;
             if (c + UNROLL <= k_real) {
@@ -1033,11 +1040,13 @@ static void launch_quantize_tensorwise_padn(const FType *x, QType *y,
                               (Kp <= std::numeric_limits<int32_t>::max()) &&
                               (Np <= std::numeric_limits<int32_t>::max());
         if (row_path) {
-            const int64_t grid = std::min<int64_t>(out_rows, PAD_MAX_BLOCKS);
+            // (Np, G) grid: x-major dispatch keeps the row order of the flat form.
+            const dim3 grid(static_cast<uint32_t>(std::min<int64_t>(Np, PAD_MAX_BLOCKS)),
+                            static_cast<uint32_t>(out_rows / Np));
             quantize_tensorwise_padn_row_kernel<PAD_ROW_BLOCK_SIZE, UNROLL, FType, QType,
                                                 ComputeType>
                 <<<grid, PAD_ROW_BLOCK_SIZE, 0, stream>>>(
-                    x, y, op, out_rows, static_cast<int32_t>(N), static_cast<int32_t>(Np),
+                    x, y, op, static_cast<int32_t>(N), static_cast<int32_t>(Np),
                     static_cast<int32_t>(K), static_cast<int32_t>(Kp));
             return;
         }

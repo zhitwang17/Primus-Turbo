@@ -185,17 +185,25 @@ def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_
     store_c.store(c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
-def _store_split(store_c, quad, base_row, base_col, esplit, full):
+def _store_split(store_c, quad, base_row, base_col, esplit, full, paired=False, merged=False):
     """Emit a body's four accumulator quadrants as _NN_E_SCHED[esplit]'s barrier-separated
     store batches instead of one burst. ``quad`` is (frag, d_row, d_col) per quadrant in
-    (c00, c01, c10, c11) order; esplit=0 reproduces the single burst."""
+    (c00, c01, c10, c11) order; esplit=0 reproduces the single burst. ``paired`` picks the
+    adjacent-column store (StoreCPerTensor.store_paired), which needs a row-permuted B feed;
+    ``merged`` picks the row-merged one (store_row_merge), which needs no feed change."""
+    if const_expr(paired):
+        emit = store_c.store_paired
+    elif const_expr(merged):
+        emit = store_c.store_row_merge
+    else:
+        emit = store_c.store
     sched = [tuple(q for q in b if full or q % 2 == 0) for b in _NN_E_SCHED[esplit]]
     for bi in range_constexpr(len(sched)):
         if const_expr(bi == 1 or (bi > 1 and len(sched[bi]) > 0)):
             rocdl.s_barrier()
         for qi in range_constexpr(len(sched[bi])):
             frag, d_row, d_col = quad[sched[bi][qi]]
-            store_c.store(frag, base_row + d_row, base_col + d_col)
+            emit(frag, base_row + d_row, base_col + d_col)
 
 
 # PERSISTENT grouped NN dgrad: a fixed grid of num_sms WGs strides the tile space via scf.for.
@@ -235,10 +243,13 @@ def _compile_grouped_nn(
     cstore_aux: int = 0,  # non-temporal aux for the dx C store (1=GLC bypass-L2): keeps write-once dx out of L2 so the reused weight B stays resident. 0 = default
     nn_loop_tr_vmcnt: int = -1,  # steady-state B transpose-read g2s drain hint. -1 = none: the per-K-iter rendezvous below already covers every main-loop LDS read, so an extra vmcnt only throttles g2s
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
+    n_stride: int = 0,  # B[K, n_stride] row pitch (elems); 0 => N. >N => padded aligned storage while the computed/emitted width stays N (the NN twin of the NT fwd's n_stride): the boundary body then sees the REAL width, so an N-padded operand costs no extra column-tile and C is emitted at the real width. Needs known N (int32 B span)
     nn_b0_dist2: bool = False,  # distance-2 prefetch for the always-load B0 half: 3 LDS buffers (cur/next/next2) so g2s writes the oldest consumed slot (no WAR stall) and a 3-iter window hides transpose-load latency. A/b1 stay distance-1 (+16KB LDS, still 1 WG/CU)
     nn_kshear: bool = True,  # K % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line (measured +25.7% TCP_TCC_READ_REQ on dY[M,2880]). Off = legacy split loads
     nn_elgk: bool = True,  # graded drain of the B transpose reads: the b0 stage rides the a0 fragment's compiler-scored wait, the b1 stage drains one tile at a time inside its mfma column. Off = one lgkmcnt(0) per stage with no mfma to cover it
     nn_esplit: int = 4,  # epilogue store schedule, see _NN_E_SCHED: how the tile's four accumulator quadrants are split into barrier-separated store batches. 0 = one 128-store burst after the trailing barrier
+    nn_pw2: bool = False,  # prologue rendezvous 2 proves only "k-block 0 resident" instead of also draining k-block 1's first B fill, whose latency the tile has no compute to cover; the first iteration's own graded drain re-proves it before its reader. Off = legacy dual-count prologue
+    nn_cmerge: bool = False,  # row-merged C store: one permlane16_swap per accumulator pair puts a lane's two n-fragments in the same 32-lane half, so each store covers one row's whole 64 B (the write-request granularity) instead of 32 B of each of 4 rows -- same bytes and store count, half the write requests. Off = per-fragment scalar stores
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad: a fixed grid of WGs strides the tile
     space via scf.for, amortising per-WG fixed cost. ``group_m``/``group_n`` port the NT
@@ -260,16 +271,34 @@ def _compile_grouped_nn(
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
-    # Known N: scalar epilogue columns are always < N, so the per-element OOB compare is dead (mask kept when N % LDS_BLOCK_N != 0).
-    _col_safe = N > 0 and (N % BLOCK_N == 0 or (nn_halfn and N % LDS_BLOCK_N == 0))
+    NS = n_stride if n_stride else N  # B row pitch; the computed/emitted width stays N
+    assert NS >= N
+    _WAVES_N = LDS_BLOCK_N // (N_TILES_B * 16)  # waves spanning one B LDS half
+    _n_rem = N % BLOCK_N if N > 0 else 0
+    # Boundary-N body width in B column-tiles per wave (N_TILES_B = the full b0 half). The last
+    # N-block carries only _n_rem valid columns; the column-tiles past them are pure padding, so
+    # the boundary body drops those and the pad costs neither an mfma nor a store. The LDS pool
+    # and its g2s stay full width, so every drain count is the half body's untouched.
+    _bnd_ntb = (
+        min(ceildiv(_n_rem, _WAVES_N * 16), N_TILES_B)
+        if (nn_halfn and not nn_halfn_noload and not store_cshuffle and 0 < _n_rem <= LDS_BLOCK_N)
+        else N_TILES_B
+    )
+    _BND_COLS = _bnd_ntb * _WAVES_N * 16  # columns the boundary body reaches
+    # Known N: scalar epilogue columns are always < N, so the per-element OOB compare is dead
+    # (the mask stays when the boundary body's span overshoots the last block's valid width).
+    _col_safe = N > 0 and (N % BLOCK_N == 0 or (nn_halfn and N % _BND_COLS == 0))
     _nb_c = ceildiv(N, BLOCK_N) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
     # Group-offs table form (see _SGPR_GO_MAX_G): SGPR/s_buffer_load vs lane-resident gather.
     _sgo = G <= _SGPR_GO_MAX_G
-    # B[G,K,N] spans < 2^31 elements: its SRD base/extent then stay int32, and each group's base
+    # B[G,K,NS] spans < 2^31 elements: its SRD base/extent then stay int32, and each group's base
     # is a compile-time constant that drops straight out of the tile decode. _B_GRP=1 keeps the
     # runtime form (the decode yields the plain group index and the caller scales it).
-    _b32 = N > 0 and G * K * N < 2**31
-    _B_GRP = K * N if _b32 else 1
+    _b32 = N > 0 and G * K * NS < 2**31
+    # The runtime span form takes its pitch from c_n (= the emitted width), so a wider B pitch has
+    # to be resolvable at compile time.
+    assert NS == N or _b32, "n_stride needs a known N with an int32 B span"
+    _B_GRP = K * NS if _b32 else 1
     # A (dY) row pitch is K, so K%128!=0 straddles every other row's K-block across a cache
     # line (two L1->L2 requests). Fetching each row's enclosing line restores one request/row;
     # halves rotate over 3 LDS slots. Needs the CShuffle pool's LDS, so the two are exclusive.
@@ -398,7 +427,7 @@ def _compile_grouped_nn(
             # Fold each tile element base into the i64 SRD base; in-tile offsets stay int32, num_records clamps to the group.
             # All of these are non-negative, so index_castui: the signed cast sign-extends, which drags a
             # 64-bit multiply-and-carry chain behind every base and extent.
-            cn_i = arith.index(N) if const_expr(_b32) else arith.index_cast(T.index, c_n)
+            cn_i = arith.index(NS) if const_expr(_b32) else arith.index_cast(T.index, c_n)
             # Sheared A: the line-aligned windows start up to (m_row*K)%128 bytes before the
             # tile's first row, so the SRD base drops back by that much and every A offset
             # adds it again (m_row*K == 0 => the bias is 0, so the base never goes negative).
@@ -412,7 +441,7 @@ def _compile_grouped_nn(
                 # Whole B fits in int32 -> base/extent are one int32 add and one int32 subtract.
                 _b_off = group_b + block_n * fx.Int32(BLOCK_N)
                 b_base = uindex(_b_off)
-                b_nrec = arith.index(G * K * N) - b_base
+                b_nrec = arith.index(G * K * NS) - b_base
             else:
                 b_base = arith.index_cast(T.index, group_b) * arith.index(K) * cn_i + arith.index_cast(
                     T.index, block_n * BLOCK_N
@@ -439,7 +468,10 @@ def _compile_grouped_nn(
                 )
             else:
                 gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=_nnwz)
+            # B's row pitch is its STORAGE width: with n_stride the padded pitch is a compile-time
+            # constant, otherwise it is the emitted width the launch already carries in c_n.
+            _b_pitch = fx.Int32(NS) if const_expr(n_stride) else c_n
+            gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, _b_pitch, N_LDS_ROUNDS, wswz=_nnwz)
 
             # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
             mfma = _build_mfma(
@@ -513,6 +545,40 @@ def _compile_grouped_nn(
                     store_aux=cstore_aux,
                     col_safe=_col_safe,
                 )
+            if const_expr(_bnd_ntb < N_TILES_B):
+                # Narrow twin of (mfma, b_s2r, store_c) for the boundary body: _bnd_ntb column
+                # tiles per wave span the last block's valid width, so the pad columns cost
+                # neither an mfma nor a store. The transpose reads take the SAME full-width LDS
+                # pool at a narrower per-wave stride (the pool and its g2s are untouched), so the
+                # drain counts stay the half body's -- pitfalls/05: never move synchronization in
+                # a boundary variant.
+                mfma_b = _build_mfma(
+                    N_TILES_A,
+                    _bnd_ntb,
+                    cbsz,
+                    blgp,
+                    asm_mode=("2" if acc_mode == "agpr" else "3") if agpr_inplace else None,
+                )
+                b_s2r_b = S2RLoaderTr(
+                    wave_n,
+                    _bnd_ntb,
+                    _bnd_ntb * 16,
+                    inline_asm=(agpr_inplace and acc_mode == "agpr"),
+                    wswz=_nnwz,
+                )
+                store_c_b = StoreCPerTensor(
+                    A_scale,
+                    B_scale,
+                    C,
+                    m_end,
+                    c_n,
+                    mfma_b.idx,
+                    N_TILES_A,
+                    _bnd_ntb,
+                    _out_ty,
+                    store_aux=cstore_aux,
+                    col_safe=_col_safe,
+                )
 
             # Before-mfma scheduling barrier; after-mfma barriers stay real (gfx950 mfma-src/ds-read VGPR-overlap race).
             def _ibar():
@@ -531,17 +597,39 @@ def _compile_grouped_nn(
 
             # Runtime half-N skip: on the boundary block the b1 column half is all-OOB; the nq==1 body drops only its mfma+stores, leaving g2s/barriers unchanged (race-free).
             def _do_body(nq):
-                _full = nq == 2  # nq==2 full; nq in {0,1} half (skip c01/c11 mfma+store)
-                _ld_b1 = nq != 0  # nq==0 half-noload: drop the all-OOB b1 g2s too
+                _full = nq == 2  # nq==2 full; nq in {0,1,3,4} half (skip c01/c11 mfma+store)
+                _bnd = nq >= 3  # narrow half: also drop b0's all-padding upper column tiles
+                _ld_b1 = nq != 0  # half-noload: drop the all-OOB b1 g2s too
+                _mm = mfma_b if _bnd else mfma
+                _bs2r = b_s2r_b if _bnd else b_s2r
+                _st = store_c_b if _bnd else store_c
+                _nacc = N_TILES_A * (_bnd_ntb if _bnd else N_TILES_B)
                 # Half body (nq==1): b1 transpose reads are dead; its g2s is re-aimed at b0 so loads become L2 hits instead of wasted HBM past c_n.
                 _b1_off = B1_gl_offset if _full else B0_gl_offset
-                # Half-body drain: lowering allowed in-flight only over-drains; gfx950 retires vmcnt out of order so drop one issue group for slack.
-                _wi = _w2 = _w1 = (0) if nq == 0 else (N_LDS_STEPS_A + N_LDS_STEPS_B)
-                # Graded drain: attach vmcnt to phase-trailing barriers that already separate a fill from its reader; nq==0 keeps the fully-drained rendezvous.
-                _nd = 2 * (N_LDS_STEPS_A + N_LDS_STEPS_B)
+                # Graded drain: attach vmcnt to the phase-trailing barriers that already separate
+                # a fill from its reader. vmcnt(n) only proves a fill landed once n further loads
+                # were issued behind it, so the counts are the body's OWN issue counts. Two chains
+                # bind, both ending at the after-c11 barrier: the distance-2 A fill (its
+                # iteration's b1 fill, then a whole iteration) and the distance-1 A fill (the rest
+                # of its iteration, then the next one's A and b0). Grade to the tighter, keeping
+                # one A group of slack -- gfx950 does not retire vmcnt strictly in order, so a
+                # zero-slack count races (measured det 0/10 on bodies that fill less; that is why
+                # nn_halfn_noload, whose b1 fill is gone, must take the fully-drained rendezvous).
+                _nb0 = N_LDS_STEPS_B
+                _nb1 = N_LDS_STEPS_B if _ld_b1 else 0
+                _fulld = nq == 0
+                _wi = _w2 = _w1 = 0 if _fulld else (N_LDS_STEPS_A + _nb0)
+                _nd = min(_nb0 + 2 * _nb1, 2 * _nb0 + _nb1) + N_LDS_STEPS_A
+                # k-block 1's three fills are the ones in flight at the second rendezvous, so
+                # counting them makes that wait prove exactly "k-block 0 is resident": vmcnt(n)
+                # always means "all but the newest n issues landed", so every in-loop count keeps
+                # its own guarantee unchanged, and the first iteration's trailing drain (_nd, its
+                # own issue count) re-proves these three before the rotate hands them to a reader.
+                if const_expr(nn_pw2 and not (_fulld or _kshear)):
+                    _w2 = N_LDS_STEPS_A + _nb0 + _nb1
 
                 def _dbar():
-                    if nq == 0:
+                    if _fulld:
                         rocdl.s_barrier()
                     else:
                         wait_barrier(_nd)
@@ -559,10 +647,10 @@ def _compile_grouped_nn(
                 b_cur1 = lds.B_lds_cur_1
                 b_next0 = lds.B_lds_next_0
                 b_next1 = lds.B_lds_next_1
-                c00 = [mfma.zero_value] * N_ACCUMS
-                c01 = [mfma.zero_value] * N_ACCUMS
-                c10 = [mfma.zero_value] * N_ACCUMS
-                c11 = [mfma.zero_value] * N_ACCUMS
+                c00 = [_mm.zero_value] * _nacc
+                c01 = [_mm.zero_value] * _nacc
+                c10 = [_mm.zero_value] * _nacc
+                c11 = [_mm.zero_value] * _nacc
 
                 b_g2s.load(b_cur0, B0_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
                 a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
@@ -590,12 +678,12 @@ def _compile_grouped_nn(
                     # b0's reads stay in flight: a0 is read after them and lgkm retires in order,
                     # so the wait the backend must emit for a0 (it feeds the first mfma) already
                     # covers the asm prefix; draining here only exposes b0's latency ahead of a0.
-                    b0_frag = b_s2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt, drain=not _elgk)
+                    b0_frag = _bs2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt, drain=not _elgk)
                     a0_frag = _ld_a(a_cur0, a_prev0)
                     a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                     _ibar()
                     rocdl.s_setprio(1)
-                    c00 = mfma.call(a0_frag, b0_frag, c00)
+                    c00 = _mm.call(a0_frag, b0_frag, c00)
                     rocdl.s_setprio(0)
                     _dbar()
                     if const_expr(_full):
@@ -603,17 +691,17 @@ def _compile_grouped_nn(
                         # issue now (keeping the g2s and the barrier as latency cover) and
                         # drain per tile inside the mfma column below.
                         if const_expr(_elgk):
-                            b1_raw = _nn_b_tr_issue(b_s2r, b_cur1, nn_loop_tr_vmcnt)
+                            b1_raw = _nn_b_tr_issue(_bs2r, b_cur1, nn_loop_tr_vmcnt)
                         else:
-                            b1_frag = b_s2r.load(b_cur1, vmcnt=nn_loop_tr_vmcnt)
+                            b1_frag = _bs2r.load(b_cur1, vmcnt=nn_loop_tr_vmcnt)
                     b_g2s.load(b_cur0, B0_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
                     _ibar()
                     rocdl.s_setprio(1)
                     if const_expr(_full):
                         if const_expr(_elgk):
-                            c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                            c01, b1_frag = _nn_b_tr_mfma(_mm, b1_raw, a0_frag, c01)
                         else:
-                            c01 = mfma.call(a0_frag, b1_frag, c01)
+                            c01 = _mm.call(a0_frag, b1_frag, c01)
                     rocdl.s_setprio(0)
                     _dbar()
                     a1_frag = _ld_a(a_cur1, a_prev1)
@@ -622,18 +710,18 @@ def _compile_grouped_nn(
                     a_g2s.load(a_prev0, A0_gl_offset + (k + 2) * BLOCK_K)
                     _ibar()
                     rocdl.s_setprio(1)
-                    c10 = mfma.call(a1_frag, b0_frag, c10)
+                    c10 = _mm.call(a1_frag, b0_frag, c10)
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
                     if const_expr(_ld_b1):
                         b_g2s.load(b_cur1, _b1_off + arith.index((k + 2) * BLOCK_K) * cn_i)
-                    if nq == 0:
+                    if const_expr(not _ld_b1):
                         wait_barrier(_wi)
                     else:
                         _ibar()
                     rocdl.s_setprio(1)
                     if const_expr(_full):
-                        c11 = mfma.call(a1_frag, b1_frag, c11)
+                        c11 = _mm.call(a1_frag, b1_frag, c11)
                     rocdl.s_setprio(0)
                     _dbar()
                     if _nt_vmcnt >= 0:
@@ -650,42 +738,42 @@ def _compile_grouped_nn(
                     b_cur1, b_next1 = b_next1, b_cur1
 
                 k = K_ITERS - 2
-                b0_frag = b_s2r.load(b_cur0, drain=not _elgk)
+                b0_frag = _bs2r.load(b_cur0, drain=not _elgk)
                 a0_frag = _ld_a(a_cur0, a_prev0)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
-                c00 = mfma.call(a0_frag, b0_frag, c00)
+                c00 = _mm.call(a0_frag, b0_frag, c00)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        b1_raw = _nn_b_tr_issue(b_s2r, b_cur1)
+                        b1_raw = _nn_b_tr_issue(_bs2r, b_cur1)
                     else:
-                        b1_frag = b_s2r.load(b_cur1)
+                        b1_frag = _bs2r.load(b_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                        c01, b1_frag = _nn_b_tr_mfma(_mm, b1_raw, a0_frag, c01)
                     else:
-                        c01 = mfma.call(a0_frag, b1_frag, c01)
+                        c01 = _mm.call(a0_frag, b1_frag, c01)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = _ld_a(a_cur1, a_prev1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
-                c10 = mfma.call(a1_frag, b0_frag, c10)
+                c10 = _mm.call(a1_frag, b0_frag, c10)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 # This stage feeds the last phase's c00, past the c11 mfma below and the slot
                 # rotate, so its reads ride the next a0 fragment's wait with a whole mfma group
                 # of cover.
-                b0_frag = b_s2r.load(b_next0, drain=not _elgk)
+                b0_frag = _bs2r.load(b_next0, drain=not _elgk)
                 a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
-                    c11 = mfma.call(a1_frag, b1_frag, c11)
+                    c11 = _mm.call(a1_frag, b1_frag, c11)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a_prev0, a_cur0, a_next0 = _rot_a(a_prev0, a_cur0, a_next0)
@@ -697,36 +785,36 @@ def _compile_grouped_nn(
                 a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
                 wait_barrier(0)
                 rocdl.s_setprio(1)
-                c00 = mfma.call(a0_frag, b0_frag, c00)
+                c00 = _mm.call(a0_frag, b0_frag, c00)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        b1_raw = _nn_b_tr_issue(b_s2r, b_cur1)
+                        b1_raw = _nn_b_tr_issue(_bs2r, b_cur1)
                     else:
-                        b1_frag = b_s2r.load(b_cur1)
+                        b1_frag = _bs2r.load(b_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                        c01, b1_frag = _nn_b_tr_mfma(_mm, b1_raw, a0_frag, c01)
                     else:
-                        c01 = mfma.call(a0_frag, b1_frag, c01)
+                        c01 = _mm.call(a0_frag, b1_frag, c01)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = _ld_a(a_cur1, a_prev1)
                 a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
-                c10 = mfma.call(a1_frag, b0_frag, c10)
+                c10 = _mm.call(a1_frag, b0_frag, c10)
                 if const_expr(_full):
-                    c11 = mfma.call(a1_frag, b1_frag, c11)
+                    c11 = _mm.call(a1_frag, b1_frag, c11)
                 rocdl.s_setprio(0)
                 # Epilogue store schedule: batching each quadrant behind a barrier keeps all
                 # waves inside one row/column band (contiguous columns) instead of one spread
                 # burst. Separator must be the barrier; a vmcnt throttle drains but never aligns.
                 _store_split(
-                    store_c,
+                    _st,
                     (
                         (c00, 0, 0),
                         (c01, 0, LDS_BLOCK_N),
@@ -734,9 +822,10 @@ def _compile_grouped_nn(
                         (c11, LDS_BLOCK_M, LDS_BLOCK_N),
                     ),
                     base_row,
-                    base_col,
+                    block_n * BLOCK_N + wave_n * (_bnd_ntb * 16) if _bnd else base_col,
                     _esplit,
                     _full,
+                    merged=nn_cmerge and not _bnd,  # the narrow body's odd _bnd_ntb has no pair
                 )
 
             # Wave-uniform runtime half-N predicate (block_n is uniform per tile).
@@ -747,8 +836,12 @@ def _compile_grouped_nn(
                 arith.select(_lastw <= fx.Int32(LDS_BLOCK_N), fx.Int32(1), fx.Int32(0)),
                 fx.Int32(0),
             )
-            # nn_halfn=False forces the full body; default True skips the all-OOB b1 half on the boundary block.
-            _half_nq = 0 if const_expr(nn_halfn_noload) else 1
+            # nn_halfn=False forces the full body; default True skips the all-OOB b1 half on the
+            # boundary block. _bnd_ntb<N_TILES_B narrows that SAME branch (nq==3, or nq==4 when
+            # the fill narrows with it) instead of adding a third body: c_n equals the compiled N
+            # (one autotune key supplies both), so _is_half can only fire on a block whose valid
+            # width is <= the narrow span.
+            _half_nq = 3 if const_expr(_bnd_ntb < N_TILES_B) else (0 if const_expr(nn_halfn_noload) else 1)
             if const_expr(nn_halfn):
                 if _readfirstlane_i32(_is_half) == fx.Int32(1):
                     _do_body(_half_nq)
@@ -822,7 +915,11 @@ def _compile_grouped_nt(
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
+    n_stride: int = 0,  # B_T row-count pitch (elems) for its group span; 0 => N. >N => padded aligned storage while compute stays N (the N-axis twin of k_stride): the boundary body then sees the REAL width, so an N-padded weight costs no extra column-tile and C is emitted at the real width. Needs known N (int32 B span)
+    bnd_col_safe: bool = False,  # let the NARROW boundary body prove the epilogue's per-element column compare dead (its span already equals the last block's valid width). Default off keeps every existing caller's bytecode
     nt_esplit: int = 4,  # epilogue store schedule (see _NN_E_SCHED), the twin of the NN dgrad's nn_esplit. 0 = one 128-store burst
+    nt_pw2: bool = False,  # single-round-trip prologue: rendezvous 1 drains k-block 0 outright and rendezvous 2 only caps the in-flight set at k-block 1's issue count, so the tile enters the loop with those fills in flight instead of paying a second serialised round trip the prologue has no mfma to cover. Off = legacy dual-count prologue
+    nt_cpair: bool = False,  # paired C store: permute B's N rows into LDS (c_pair_row_perm) so a lane's two n-fragments are ADJACENT output columns and one dword store covers both, halving the write requests (64 B per request = the granularity, vs 32 B). Needs an even known N and the distance-2 body; the narrow boundary body keeps the scalar store
 ):
     """Grouped NT forward (out = a @ b^T). persistent=True: a fixed grid of WGs strides the
     tile space via scf.for (cap_cu reserves CUs for comm overlap); persistent=False: one tile
@@ -848,8 +945,6 @@ def _compile_grouped_nt(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
     KS = k_stride if k_stride else K  # addressing row stride (>= K); compute dim stays K
     assert KS >= K
-    # Known N makes the scalar epilogue per-element OOB select dead (nt_dist2 supplies the in-bounds half-N boundary body).
-    _col_safe = N > 0 and (N % BLOCK_N == 0 or (nt_dist2 and N % LDS_BLOCK_N == 0))
     _nb_c = ceildiv(N, BLOCK_N) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
     # Group-offs table form (see _SGPR_GO_MAX_G): SGPR/s_buffer_load vs lane-resident gather.
     _sgo = G <= _SGPR_GO_MAX_G
@@ -857,11 +952,30 @@ def _compile_grouped_nt(
     # the last N-block's valid width fits the lower half of the b0 LDS pool its upper columns
     # are pure padding, so one column-tile per wave covers it. Needs the runtime half-N branch.
     _bnd_ntb = 1 if (nt_dist2 and N > 0 and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2) else N_TILES_B
-    # B_T[G,N,KS] spans < 2^31 elements: its SRD base/extent then stay int32, and each group's
+    # Columns the boundary body reaches (== LDS_BLOCK_N when it is not narrowed).
+    _BND_COLS = _bnd_ntb * (LDS_BLOCK_N // (N_TILES_B * 16)) * 16
+    # Known N makes the scalar epilogue per-element OOB select dead (nt_dist2 supplies the
+    # in-bounds half-N boundary body). bnd_col_safe additionally credits the NARROW boundary
+    # body: its span is the last block's valid width exactly, so the compare is dead there too.
+    _col_safe = N > 0 and (
+        N % BLOCK_N == 0 or (nt_dist2 and N % (_BND_COLS if bnd_col_safe else LDS_BLOCK_N) == 0)
+    )
+    NS = n_stride if n_stride else N  # B_T row-count pitch; compute width stays N
+    assert NS >= N
+    # B_T[G,NS,KS] spans < 2^31 elements: its SRD base/extent then stay int32, and each group's
     # base is a compile-time constant that drops straight out of the tile decode. _B_GRP=1 keeps
     # the runtime form (the decode yields the plain group index and the caller scales it).
-    _b32 = N > 0 and G * N * KS < 2**31
-    _B_GRP = N * KS if _b32 else 1
+    _b32 = N > 0 and G * NS * KS < 2**31
+    # The runtime span form takes its pitch from c_n (= the compute width), so a wider B pitch
+    # has to be resolvable at compile time.
+    assert NS == N or _b32, "n_stride needs a known N with an int32 B_T span"
+    # The paired C store needs an even output width: every pair is then aligned (the row pitch is
+    # N*2 bytes) and its first column's bound is the pair's OOB predicate. The CShuffle store has
+    # its own fixed value->address map, so it is not a paired-store host.
+    assert not nt_cpair or (N > 0 and N % 2 == 0 and nt_dist2 and not store_cshuffle), (
+        "nt_cpair needs an even known N, on the distance-2 scalar-store body"
+    )
+    _B_GRP = NS * KS if _b32 else 1
 
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
     _cshuf_n = 8 * 16 * (N_TILES_B * 16)
@@ -955,12 +1069,75 @@ def _compile_grouped_nt(
             gb = gi if const_expr(_B_GRP == 1) else gi * fx.Int32(_B_GRP)
             return gb, _lane_tbl_get(_tcs, gi), _lane_tbl_get(_g0, gi), _lane_tbl_get(_g1, gi)
 
-        def _do_tile(tt, group_b, tile_start, m_start, m_end):
-            local = tt - tile_start
+        def _tile_swizzle(tt, tile_start, m_start, m_end):
             # L2-reuse tile swizzle: group_n band -> group_m 1D -> row-major fallback.
-            local_block_m, block_n = _grouped_block_mn(
-                local, m_start, m_end, n_blocks, BLOCK_M, group_m, group_n, n_blocks_c=_nb_c, unsigned=True
+            return _grouped_block_mn(
+                tt - tile_start,
+                m_start,
+                m_end,
+                n_blocks,
+                BLOCK_M,
+                group_m,
+                group_n,
+                n_blocks_c=_nb_c,
+                unsigned=True,
             )
+
+        def _tile_feed(local_block_m, block_n, group_b, m_start, lane_id, wave_id):
+            """One tile's A/B addressing and its pair of G2S loaders: SRD rebase off the tile's
+            element base, then the per-wave global swizzle. Returns the loaders plus the pieces
+            the narrow boundary twin re-uses (its own B loader is built off b_div/gl_off_b)."""
+            m_row = m_start + local_block_m * BLOCK_M
+            # Fold the tile's element base into the i64 SRD base; in-tile offsets stay int32.
+            # All of these are non-negative, so index_castui: the signed cast sign-extends, which
+            # drags a 64-bit multiply-and-carry chain behind every base and extent.
+            m_total = _m_total_v if const_expr(_sgo) else _readfirstlane_i32(_m_total_v)
+            a_base = uindex(m_row) * arith.index(KS)
+            a_nrec = (uindex(m_total) - uindex(m_row)) * arith.index(KS)
+            if const_expr(_b32):
+                # Whole B_T fits in int32 -> base/extent are one int32 add and one int32 subtract.
+                _b_off = group_b + block_n * fx.Int32(BLOCK_N * KS)
+                b_base = uindex(_b_off)
+                b_nrec = arith.index(G * NS * KS) - b_base
+            else:
+                cn_i = arith.index_cast(T.index, c_n)
+                b_base = (
+                    arith.index_cast(T.index, group_b) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
+                ) * arith.index(KS)
+                b_nrec = arith.index(G) * cn_i * arith.index(KS) - b_base
+
+            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+            gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
+            a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+            b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+            gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
+            # nt_cpair: B enters LDS row-permuted so the full body's epilogue can store adjacent
+            # column pairs (see StoreCPerTensor.store_paired). The narrow boundary twin keeps the
+            # identity offsets: it reads one column-tile per wave, whose 16-row group is not the
+            # permutation's 32-row block, and it stores scalars.
+            gl_off_b_p = (
+                compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False, row_perm=True)
+                if const_expr(nt_cpair)
+                else gl_off_b
+            )
+
+            # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
+            mfma = _build_mfma(
+                N_TILES_A,
+                N_TILES_B,
+                cbsz,
+                blgp,
+                asm_mode=("2" if acc_mode == "agpr" else "3") if agpr_inplace else None,
+            )
+
+            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            b_g2s = G2SLoader(b_div, gl_off_b_p, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            return a_g2s, b_g2s, m_row, mfma, b_div, gl_off_b
+
+        def _do_tile(tt, group_b, tile_start, m_start, m_end):
+            local_block_m, block_n = _tile_swizzle(tt, tile_start, m_start, m_end)
 
             a_cur0 = lds.A_lds_cur_0
             a_cur1 = lds.A_lds_cur_1
@@ -976,48 +1153,14 @@ def _compile_grouped_nt(
             wave_m = wave_id // 4
             wave_n = wave_id % 4
 
-            m_row = m_start + local_block_m * BLOCK_M
-            # Fold the tile's element base into the i64 SRD base; in-tile offsets stay int32.
-            # All of these are non-negative, so index_castui: the signed cast sign-extends, which
-            # drags a 64-bit multiply-and-carry chain behind every base and extent.
-            m_total = _m_total_v if const_expr(_sgo) else _readfirstlane_i32(_m_total_v)
-            a_base = uindex(m_row) * arith.index(KS)
-            a_nrec = (uindex(m_total) - uindex(m_row)) * arith.index(KS)
-            if const_expr(_b32):
-                # Whole B_T fits in int32 -> base/extent are one int32 add and one int32 subtract.
-                _b_off = group_b + block_n * fx.Int32(BLOCK_N * KS)
-                b_base = uindex(_b_off)
-                b_nrec = arith.index(G * N * KS) - b_base
-            else:
-                cn_i = arith.index_cast(T.index, c_n)
-                b_base = (
-                    arith.index_cast(T.index, group_b) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
-                ) * arith.index(KS)
-                b_nrec = arith.index(G) * cn_i * arith.index(KS) - b_base
             A0_gl_offset = 0
             A1_gl_offset = LDS_BLOCK_M * KS
             B0_gl_offset = 0
             B1_gl_offset = LDS_BLOCK_N * KS
 
-            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
-            gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
-            a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-            b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
-
-            gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
-
-            # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
-            mfma = _build_mfma(
-                N_TILES_A,
-                N_TILES_B,
-                cbsz,
-                blgp,
-                asm_mode=("2" if acc_mode == "agpr" else "3") if agpr_inplace else None,
+            a_g2s, b_g2s, m_row, mfma, b_div, gl_off_b = _tile_feed(
+                local_block_m, block_n, group_b, m_start, lane_id, wave_id
             )
-
-            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             b_s2r = S2RLoader(wave_n, N_TILES_B)
             if const_expr(store_cshuffle):
@@ -1077,6 +1220,7 @@ def _compile_grouped_nt(
                     # Narrow twin of (mfma, b_s2r, b_g2s, store_c) for the boundary body: one B
                     # column-tile per wave and one g2s load step cover the same pool rows, so the
                     # step count equals the column-tile count and the loaded rows are the ones read.
+                    # It keeps the identity feed and the scalar store, so nt_cpair never reaches it.
                     assert N_LDS_STEPS_B == N_TILES_B  # both BLOCK_N/128; keeps the mapping 1:1
                     mfma_b = _build_mfma(
                         N_TILES_A,
@@ -1116,6 +1260,21 @@ def _compile_grouped_nt(
                     # body only deletes ds_read/mfma/g2s work, the vmcnt+barrier sequence is
                     # unchanged (pitfalls/05: never move synchronization in a boundary variant).
                     _nd = _NB_DRAIN if _full else _NB_DRAIN_HALF
+                    # One HBM round trip in the prologue instead of two: rendezvous 1 drains
+                    # k-block 0 outright, then k-block 1 is issued and rendezvous 2 only caps the
+                    # in-flight set at exactly that issue count, so the tile enters the loop with
+                    # k-block 1 still in flight and iteration 0's own graded drain re-proves it
+                    # before the rotate hands it to a reader. The legacy counts made rendezvous 2
+                    # drain k-block 1's first B fill too, and the tile has no mfma there to cover
+                    # it. Rendezvous 1 has to stay a full drain: the divergent barrier
+                    # (wave_m == 1 only) skews the two M-half wave groups by one barrier slot, so
+                    # the group entering iteration 0 reads pool halves proven only by the group
+                    # still waiting at rendezvous 1, and vmcnt(0) is the one count whose guarantee
+                    # survives gfx950's out-of-order vmcnt retirement. Relaxing rendezvous 2 while
+                    # leaving rendezvous 1 on the legacy count measures det:false (pitfalls/04).
+                    _nbs = _bnd_ntb if _bnd else N_LDS_STEPS_B
+                    _w1 = 0 if nt_pw2 else _nd
+                    _w2 = 2 * N_LDS_STEPS_A + (2 if _full else 1) * _nbs if nt_pw2 else _nd
                     a_c0, a_c1, a_n0, a_n1 = a_cur0, a_cur1, a_next0, a_next1
                     b_c0, b_c1, b_n0, b_n1 = b_cur0, b_cur1, b_next0, b_next1
 
@@ -1130,18 +1289,19 @@ def _compile_grouped_nt(
                     if const_expr(_full):
                         _bg2s.load(b_c1, B1_gl_offset + 0 * BLOCK_K)
                     a_g2s.load(a_c1, A1_gl_offset + 0 * BLOCK_K)
+                    # persistent: unconditional barrier for cross-tile phase-correctness; 8w: one tile/WG so the divergent barrier is correct.
                     if const_expr(persistent):
                         rocdl.s_barrier()
                     else:
                         if wave_m == 1:
                             rocdl.s_barrier()
-                    wait_barrier(_nd)
+                    wait_barrier(_w1)
                     _bg2s.load(b_n0, B0_gl_offset + 1 * BLOCK_K)
                     a_g2s.load(a_n0, A0_gl_offset + 1 * BLOCK_K)
                     if const_expr(_full):
                         _bg2s.load(b_n1, B1_gl_offset + 1 * BLOCK_K)
                     a_g2s.load(a_n1, A1_gl_offset + 1 * BLOCK_K)
-                    wait_barrier(_nd)
+                    wait_barrier(_w2)
 
                     for k in range_constexpr(K_ITERS - 2):
                         b0_frag = _bs2r.load(b_c0)
@@ -1250,6 +1410,7 @@ def _compile_grouped_nt(
                         _bcol,
                         _esplit,
                         _full,
+                        paired=nt_cpair and not _bnd,
                     )
 
                 # Wave-uniform runtime half-N predicate: last N-block whose valid width fits the b0 LDS half (b1 all padding).
@@ -2004,7 +2165,10 @@ def _grouped_compile_cfg(
     nt_group_n=0,
     cap_cu=-1,
     i64_traverse=False,
+    n_stride=0,
+    N=0,
 ):
+    assert n_stride == 0 or N > 0, "n_stride needs a known N"
     ckey = (
         "nt" if trans_b else "nn",
         K,
@@ -2023,6 +2187,8 @@ def _grouped_compile_cfg(
         nt_group_n,
         cap_cu,
         i64_traverse,
+        n_stride,
+        N,
     )
     l = _GROUPED_LAUNCH_CACHE.get(ckey)
     if l is None:
@@ -2044,6 +2210,9 @@ def _grouped_compile_cfg(
                 sched_schedbar=sched_schedbar,
                 persistent=True,
                 cap_cu=cap_cu,
+                n_stride=n_stride,
+                N=N,
+                bnd_col_safe=bool(n_stride),
             )
         else:
             l = _compile_grouped_nn(
@@ -2064,6 +2233,8 @@ def _grouped_compile_cfg(
                 persistent=True,
                 cap_cu=cap_cu,
                 i64_traverse=i64_traverse,
+                n_stride=n_stride,
+                N=N,
             )
         _GROUPED_LAUNCH_CACHE[ckey] = l
     return l
@@ -2122,6 +2293,17 @@ _NP_B_LLC = 256 << 20
 # xcd1 (group-major, B[g] L2-resident) only pays off for large B[g]; K>=4096 is the observed crossover.
 _NP_LARGE_K = 4096
 _NP_PM_CANON = (1024, 8192)
+# An N-padded operand (n_stride) is the K-and-N-padded MoE projection: its B[g] alone exceeds
+# an XCD's L2, so the tile->XCD remap has to match the 8 physical XCDs (the NT lead already
+# does) and the band has to stay narrow enough that the WGs sharing one B column-block are
+# co-resident. Measured on the deployed down-projection (G=32, N=2880, K=2944), bitwise
+# identical to (4, 8), at the deployed 4096 tokens/expert: +2.9% balanced / +2.5% heavy-skew /
+# neutral on geometric skew, and +0.3~0.5% at 2048/8192. The band width is a real optimum, not
+# noise: group_m 3 and 6 are -1.3/-1.7%, and num_xcd 16 (two bands per XCD) is -6.3%.
+# _NP_PM_CANON brackets the deployed M with 1024 (where (4, 8) is 0.9% ahead) and 8192, so the
+# race's geomean cannot see this -- hence a static lead rather than another candidate slot
+# (pitfalls/06 "never add a candidate that is never adopted").
+_NP_PADN_NN_CAND = (256, 8, 4, 0)
 
 
 def _np_regime(trans_b, N, K, G, M_total):
@@ -2134,11 +2316,11 @@ def _np_regime(trans_b, N, K, G, M_total):
     return 0  # steady -> NK autotune
 
 
-def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
+def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, n_stride=0):
     """Race the NT/NN candidates on synthetic balanced tensors at the canonical tokens/group
     and cache per static (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128."""
     # NN B[K,N] traversal: re-base B SRD per load in i64 when the per-group span K*N reaches 2^32 fp8.
-    i64_tr = (not trans_b) and (K * N >= 2**32)
+    i64_tr = (not trans_b) and (K * max(N, n_stride) >= 2**32)
 
     def mk(bm, xcd, gm, gn):
         if trans_b:  # NT: merged factory, non-persistent mode (intrinsic MMA, scalar store)
@@ -2161,6 +2343,16 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
                 # the NN twin, where this drain is redundant) -- see pitfalls/05 "NN 上能删,NT 上不能".
                 nt_vmcnt=3,
                 N=N,
+                n_stride=n_stride,
+                # Only the padN weight declares a pitch wider than N, and n_stride is already in
+                # the autotune key -- so this rides it and every padK artifact stays byte-identical.
+                bnd_col_safe=bool(n_stride),
+                # The NN dgrad's prologue relaxation (nn_pw2), on the same gate; NT needs it graded
+                # against a tightened first rendezvous because its prologue skews the wave groups.
+                nt_pw2=bool(n_stride),
+                # Paired C store, same gate: it needs B's N rows permuted on the way into LDS,
+                # which is only legal where this arm owns the compiled geometry.
+                nt_cpair=bool(n_stride),
             )
         # NN: merged factory, non-persistent mode (AGPR in-place, scalar store).
         return _compile_grouped_nn(
@@ -2181,6 +2373,15 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
             nt_vmcnt=-1,
             i64_traverse=i64_tr,
             N=N,
+            n_stride=n_stride,
+            # Prologue rendezvous 2 stops waiting for k-block 1's B fill. Rides n_stride (already
+            # in the autotune key), so every padK / non-padded artifact stays byte-identical; the
+            # gate can widen once the shapes behind it have been swept.
+            nn_pw2=bool(n_stride),
+            # Row-merged C store, same gate: the NN twin of nt_cpair. The output column is the
+            # operand's fast axis here, so the pairing is done with one cross-lane swap on the
+            # accumulators instead of a feed-side row permutation.
+            nn_cmerge=bool(n_stride),
         )
 
     if not trans_b and regime == 1:
@@ -2220,7 +2421,9 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
             cands.insert(0, _NP_STATIC_CAND)
     else:
         # dgrad NN: N-bands do not help (deep-K transpose-load core), so diversity is in (num_xcd, group_m).
-        cands = [_NP_STATIC_CAND, (256, 8, 4, 0)]
+        cands = [_NP_STATIC_CAND, _NP_PADN_NN_CAND]
+        if n_stride:  # padded-N operand -> lead with the XCD-matched pick (see _NP_PADN_NN_CAND)
+            cands = cands[::-1]
 
     def _score(launch):
         """Geomean of the launch time at every canonical M, or None if it drifts/NaNs at
@@ -2262,16 +2465,24 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     trans_b: bool = False,
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = -1,
+    n_real: "int | None" = None,
 ) -> "torch.Tensor":
     """FlyDSL per-tensor grouped fp8 GEMM (M-grouped), matching the Triton entry.
-    out[g] = a[g] @ B_view[g] * a_scale * b_scale. trans_b=True (forward) uses b [G, N, K] and
-    the NT kernel; trans_b=False (dgrad) uses b [G, K, N] and the NN kernel. group_offs [G+1]."""
+    out[g] = a[g] @ B_view[g] * a_scale * b_scale.     trans_b=True (forward) uses b [G, N, K] and
+    the NT kernel; trans_b=False (dgrad) uses b [G, K, N] and the NN kernel. group_offs [G+1].
+    n_real (< b's N dim): that dim is padded storage, so compute -- and emit C at -- the real
+    width while B keeps its padded row pitch; the padding then costs no column-tile and the
+    contiguous out needs no un-pad slice."""
     assert a.ndim == 2 and b.ndim == 3
     M_total, K = a.shape
     G = b.shape[0]
     N = b.shape[1] if trans_b else b.shape[2]
     K_b = b.shape[2] if trans_b else b.shape[1]
     assert K == K_b, f"K mismatch a={K} b={K_b}"
+    n_stride = 0
+    if n_real is not None and n_real != N:
+        assert 0 < n_real < N, "n_real narrows b's padded N dim"
+        n_stride, N = N, n_real
 
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
     # kernel reads group_offs as int64 low-words via a free int32-view; int32 callers are upcast once.
@@ -2289,7 +2500,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     nonpersist = not capped
     # NK autotune key excludes M_total; a coarse M-derived regime bucket covers every M_total (see _np_regime).
     regime = _np_regime(trans_b, N, K, G, M_total) if nonpersist else 0
-    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0)
+    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0, n_stride)
     # Full rank (not flattened): a flat reshape(-1) overflows the int32 shape pack when M_total*K > 2^31; the kernel re-bases via i64.
     a_i8 = a.view(torch.int8)
     b_i8 = b.view(torch.int8)
@@ -2308,7 +2519,9 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     if entry is None:
         if nonpersist:
             # num_cu<=0 (full device): autotune the non-persistent nt8w/nn8w swizzle (straight-line one-tile/WG body, no scf.for penalty).
-            launch = _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime)
+            launch = _autotune_np_dispatch(
+                trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, n_stride=n_stride
+            )
         else:
             # Single persistent prod config (no autotune); reached only when num_cu>0 reserves CUs. Default goes to nt8w/nn8w.
             launch = _grouped_compile_cfg(
@@ -2328,6 +2541,8 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 cap_cu=(num_cu if capped else -1),
                 # NN B[K,N] per-group traversal: i64 re-base when K*N reaches 2^32 fp8.
                 i64_traverse=((not trans_b) and (K * N >= 2**32)),
+                n_stride=n_stride,
+                N=(N if n_stride else 0),
             )
         entry = [launch, None]  # [raw @flyc.jit closure, flyc.compile'd object (lazy)]
         _GROUPED_AT_CACHE[at_key] = entry
@@ -3269,6 +3484,8 @@ def _wave4_do_tile_tn(
     lds,
     _cm,
     _cn,
+    C_M,
+    C_N,
     tile_rot=0,
     xcd_aff=None,
     xcd_rot=False,
@@ -3326,7 +3543,7 @@ def _wave4_do_tile_tn(
         # The band offset rides on the SRD BASE, not the row index, so the epilogue computes row
         # addresses exactly as the unsliced store does (shifting base_row instead would put the
         # split's scalar chain in front of every store address, penalising launches that slice nothing).
-        _shift = _readfirstlane_i32(fx.Int32(band_row) - fx.Int32(group_idx) * fx.Int32(OUT_M))
+        _shift = _readfirstlane_i32(fx.Int32(band_row) - fx.Int32(group_idx) * fx.Int32(C_M))
         _obytes = 2  # bf16/fp16 output
         # band_row < 0 = the group's leading piece: it holds K from 0, so it owns C and only the
         # pieces behind it bank. Same store instructions either way -- the piece picks the SRD base,
@@ -3334,7 +3551,7 @@ def _wave4_do_tile_tn(
         store_base = arith.select(
             fx.Int32(band_row) >= fx.Int32(0),
             _buffer_ops.extract_base_index(WS)
-            + arith.index_cast(T.index, _shift) * arith.index(OUT_N * _obytes),
+            + arith.index_cast(T.index, _shift) * arith.index(C_N * _obytes),
             _buffer_ops.extract_base_index(C),
         )
     # main loop takes the largest multiple of 6; the remainder (0..5) is the in-asm fused tail.
@@ -3361,13 +3578,13 @@ def _wave4_do_tile_tn(
         a_wave, b_wave = wave_n, wave_m
         c_m_body, c_n_body = _cn, _cm  # a-side(B) K-stride=OUT_N, b-side(A) K-stride=OUT_M
         base_row = bn_off + wave_n * (N_TILES_A * 16)  # a-side -> N origin
-        base_col = group_idx * OUT_M + bm_off + wave_m * (N_TILES_B * 16)  # b-side -> M origin
+        base_col = group_idx * C_M + bm_off + wave_m * (N_TILES_B * 16)  # b-side -> M origin
     else:
         a_op, b_op = A, B
         a_base, a_nrec, b_base, b_nrec = baseA, nrecA, baseB, nrecB
         a_wave, b_wave = wave_m, wave_n
         c_m_body, c_n_body = _cm, _cn
-        base_row = group_idx * OUT_M + bm_off + wave_m * (N_TILES_A * 16)
+        base_row = group_idx * C_M + bm_off + wave_m * (N_TILES_A * 16)
         base_col = bn_off + wave_n * (N_TILES_B * 16)
 
     gA = make_fp8_buffer_tensor_rebased(a_op, F8_IR_t, a_base, a_nrec)
@@ -3405,13 +3622,13 @@ def _wave4_do_tile_tn(
         wswz=_wswz,
     )
 
-    _c_rows = (group_idx + 1) * OUT_M
+    _c_rows = (group_idx + 1) * C_M
     store_c = StoreCPerTensor(
         A_scale,
         B_scale,
         C,
         _c_rows,
-        _cn,
+        fx.Int32(C_N),  # C's row pitch, NOT the operand K-stride _cn
         mfma.idx,
         N_TILES_A,
         N_TILES_B,
@@ -3612,18 +3829,22 @@ _WGRAD_SPLIT_WS_CACHE = {}
 _WGRAD_SPLIT_WS_SHAPE = {}
 
 
-def _wgrad_split_ws(OUT_M, OUT_N, G, device, dtype, BLOCK_M=256, BLOCK_N=256):
+def _wgrad_split_ws(
+    OUT_M, OUT_N, G, device, dtype, BLOCK_M=256, BLOCK_N=256, m_real=0, n_real=0, c_tight=False
+):
     """Scratch for the split-K slice partials: one band of OUT_M rows per bankable token chunk, at
     C's row pitch, so a slice store only swaps the band SRD's base. Persistent per (shape, device)
-    -- a fixed buffer is what CUDA-graph capture needs; the band count is memoized too."""
-    gk = (device.index, OUT_M, OUT_N, G, BLOCK_M, BLOCK_N)
+    -- a fixed buffer is what CUDA-graph capture needs; the band count is memoized too. The real
+    extents must match the kernel's: they shrink its tile grid, hence its split-band count."""
+    gk = (device.index, OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, m_real, n_real, c_tight)
     shape = _WGRAD_SPLIT_WS_SHAPE.get(gk)
     if shape is None:
         ncu = torch.cuda.get_device_properties(device).multi_processor_count
-        tpg = ceildiv(OUT_M, BLOCK_M) * ceildiv(OUT_N, BLOCK_N)
+        tpg = ceildiv(m_real or OUT_M, BLOCK_M) * ceildiv(n_real or OUT_N, BLOCK_N)
         # Sized for the widest geometry any candidate can pick (the XCD-affine one splits deepest).
         bands = _wgrad_split_geom(tpg, G * tpg, ncu)[1]
-        shape = (max(bands, 1) * OUT_M, OUT_N)
+        c_m, c_n = (m_real or OUT_M, n_real or OUT_N) if c_tight else (OUT_M, OUT_N)
+        shape = (max(bands, 1) * c_m, c_n)
         _WGRAD_SPLIT_WS_SHAPE[gk] = shape
     key = (device.index, dtype) + shape
     ws = _WGRAD_SPLIT_WS_CACHE.get(key)
@@ -3633,13 +3854,16 @@ def _wgrad_split_ws(OUT_M, OUT_N, G, device, dtype, BLOCK_M=256, BLOCK_N=256):
     return ws
 
 
-def _wgrad_bnd_ntb(n_rem, wave_n, n_tiles_b):
-    """MFMA N-tiles per wave for the b0-only body of a last N-block holding n_rem valid columns,
-    the wgrad twin of the NT kernel's ``_bnd_ntb``. Drops the tiles the remainder never reaches
-    (LDS slab and g2s unchanged); n_rem=0 keeps the full half."""
+def _wgrad_bnd_ntb(n_rem, wave_n, n_tiles_b, quantum=1):
+    """MFMA tiles per wave for the half body of a last block holding n_rem valid rows/columns, the
+    wgrad twin of the NT kernel's ``_bnd_ntb``. Drops the tiles the remainder never reaches (LDS
+    slab and g2s unchanged); n_rem=0 keeps the full half. ``quantum`` rounds the count up to what
+    the body's emission blocking can tile exactly (the A side is blocked bm=2, the B side takes
+    gcd(4, ncol) so it tiles any count)."""
     if n_rem <= 0:
         return n_tiles_b
-    return min(n_tiles_b, -(-n_rem // (wave_n * 16)))
+    nt = -(-n_rem // (wave_n * 16))
+    return min(n_tiles_b, quantum * -(-nt // quantum))
 
 
 def _compile_grouped_tn_wgrad_4wave(
@@ -3661,6 +3885,20 @@ def _compile_grouped_tn_wgrad_4wave(
     cap_cu: int = -1,
     half_bnd: int = -1,
     split_k: bool = True,
+    # Real output extents; 0 => the padded OUT_M/OUT_N. Below them, OUT_M/OUT_N stay the C and
+    # operand pitches while the boundary bodies only reach the real extent, so a padded output
+    # costs no MFMA and no store for its pad (the wgrad twin of the NT fwd's n_stride/n_real).
+    # The pad rows/columns come back unwritten -- the caller slices them off.
+    m_real: int = 0,
+    n_real: int = 0,
+    # Emit C at the REAL extents instead of the operand-derived OUT_M/OUT_N pitch, so a
+    # padded-operand wgrad writes a natively contiguous [G, m_real, n_real]. Without it the
+    # caller can only hand the real extents downstream as a strided view, and autograd's
+    # layout contract then clones it on the way into .grad -- 376 us on the gpt-oss down
+    # wgrad, 11% of the step, invisible to an autograd.grad ruler but paid by every real
+    # backward(). Operand pitches and the tile grid are untouched; only C's row pitch and
+    # per-group stride move, and both stay 128B-aligned at the deploy extents.
+    c_tight: bool = False,
     _probe: int = 0,
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
@@ -3688,8 +3926,18 @@ def _compile_grouped_tn_wgrad_4wave(
     a_lds_size = _geo.a_lds_size
     b_lds_size = _geo.b_lds_size
     _cshuf_ty = _geo.cshuf_ty
-    N_BLOCKS_M = (OUT_M + BLOCK_M - 1) // BLOCK_M
-    N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
+    # Valid output extents: what the tile grid and the boundary bodies have to cover. OUT_M/OUT_N
+    # stay the pitch everywhere else (SRD extents, C row stride, the epilogue's runtime clamps).
+    _M_VALID = m_real if m_real else OUT_M
+    _N_VALID = n_real if n_real else OUT_N
+    assert 0 < _M_VALID <= OUT_M, f"m_real={m_real} out of range for OUT_M={OUT_M}"
+    assert 0 < _N_VALID <= OUT_N, f"n_real={n_real} out of range for OUT_N={OUT_N}"
+    # C extents: the pitch/stride the epilogue, the split-K band scratch and the reduce all
+    # address C with. c_tight collapses them onto the valid extents (see the parameter).
+    _C_M = _M_VALID if c_tight else OUT_M
+    _C_N = _N_VALID if c_tight else OUT_N
+    N_BLOCKS_M = (_M_VALID + BLOCK_M - 1) // BLOCK_M
+    N_BLOCKS_N = (_N_VALID + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
     _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -3712,25 +3960,34 @@ def _compile_grouped_tn_wgrad_4wave(
     _HEAD_AFF = (group_m, group_n, 1) if _XCD_AFF is not None else None
     # The boundary bodies drop a short last block's masked MFMA, but a cheap tile frees its CU
     # early and desyncs the L2-slab phase cohorts (no resync at occ=1) -- pays off shallow, not
-    # deep. M side stays behind the launch-depth gate, N behind the cost gate. half_bnd: 1=M, 2=N.
+    # deep. Both sides take the cost gate: a body drops _BND_ROWS/_BND_COLS of its block, buying
+    # that fraction of MFMA against a phase cost ~1/_WGRAD_BND_PHASE_INV of the wall, so it is
+    # enabled deep only once what it drops beats that cost. half_bnd: 1=M, 2=N.
     _BND_GATED = half_bnd < 0 and TOTAL >= _WGRAD_AFF_ROUNDS * _NCU
     _BND_MASK = 3 if half_bnd < 0 else half_bnd
-    _HALF_M = bool(_BND_MASK & 1) and not _BND_GATED and 0 < OUT_M % BLOCK_M <= BLOCK_M // 2
+    _WAVE_M = BLOCK_M // LDS_BLOCK_M
     _WAVE_N = BLOCK_N // LDS_BLOCK_N
-    _N_REM = OUT_N % BLOCK_N if 0 < OUT_N % BLOCK_N <= LDS_BLOCK_N else 0
-    # The short N body drops _BND_COLS columns off one N-block, buying that fraction of MFMA
-    # against a phase cost ~1/_WGRAD_BND_PHASE_INV of the wall. Enable when the MFMA saved beats
-    # that cost (deep); shallow, the cost is off the wall (see _HALF_M).
+    _M_REM = _M_VALID % BLOCK_M if 0 < _M_VALID % BLOCK_M <= LDS_BLOCK_M else 0
+    _N_REM = _N_VALID % BLOCK_N if 0 < _N_VALID % BLOCK_N <= LDS_BLOCK_N else 0
+    # The A side is emitted in bm=2 tile rows, so its count rounds up to an even one.
+    _BND_ROWS = BLOCK_M - _wgrad_bnd_ntb(_M_REM, _WAVE_M, N_TILES_A, quantum=2) * _WAVE_M * 16
     _BND_COLS = BLOCK_N - _wgrad_bnd_ntb(_N_REM, _WAVE_N, N_TILES_B) * _WAVE_N * 16
+    _HALF_M = (
+        bool(_BND_MASK & 1)
+        and _M_REM > 0
+        and (not _BND_GATED or _BND_ROWS * _WGRAD_BND_PHASE_INV > N_BLOCKS_M * BLOCK_M)
+    )
     _HALF_N = (
         bool(_BND_MASK & 2)
         and _N_REM > 0
         and (not _BND_GATED or _BND_COLS * _WGRAD_BND_PHASE_INV > N_BLOCKS_N * BLOCK_N)
     )
+    _BND_NTA = _wgrad_bnd_ntb(_M_REM if _HALF_M else 0, _WAVE_M, N_TILES_A, quantum=2)
     _BND_NTB = _wgrad_bnd_ntb(_N_REM if _HALF_N else 0, _WAVE_N, N_TILES_B)
     # Every stored column is < OUT_N at compile time, so the epilogue per-element OOB select is
-    # dead: the b0-only body ends exactly on OUT_N and no full body reaches the last N-block.
-    _COL_SAFE = (OUT_N % BLOCK_N == 0) or (_HALF_N and _BND_NTB * _WAVE_N * 16 == OUT_N % BLOCK_N)
+    # dead: the b0-only body ends exactly on the valid width and no full body reaches the last
+    # N-block. Without it the runtime clamp keeps a full boundary body inside the OUT_N pitch.
+    _COL_SAFE = (_N_VALID % BLOCK_N == 0) or (_HALF_N and _BND_NTB * _WAVE_N * 16 == _N_VALID % BLOCK_N)
     # Deep-K split geometry, independent of the tile map and the chosen candidate: a slice brings its
     # own group index and a plain in-group block position, so the host scratch and every candidate
     # agree on bands.
@@ -3762,7 +4019,7 @@ def _compile_grouped_tn_wgrad_4wave(
     assert not _SPLIT or (
         _WGRAD_RED_WPT & (_WGRAD_RED_WPT - 1) == 0
         and _RED_ROWS % _RED_RPP == 0
-        and OUT_N % _WGRAD_RED_VEC == 0
+        and _C_N % _WGRAD_RED_VEC == 0
     ), "split-K reduce needs a pow2 WPT, row-aligned passes and a vector-aligned OUT_N"
 
     # Scalar store shrinks C_lds_shuffle to a stub so the 2nd deferred-write B buffer fits.
@@ -3824,7 +4081,8 @@ def _compile_grouped_tn_wgrad_4wave(
             bounds=None,
             tile_mn=None,
         ):
-            # A b0-only body only has to reach the last N-block's valid columns.
+            # A half body only has to reach the last block's valid rows / columns.
+            _nta = _BND_NTA if tile_a_halves == 1 else N_TILES_A
             _ntb = _BND_NTB if tile_b_halves == 1 else N_TILES_B
             _wave4_do_tile_tn(
                 t,
@@ -3843,9 +4101,9 @@ def _compile_grouped_tn_wgrad_4wave(
                 OUT_M=OUT_M,
                 OUT_N=OUT_N,
                 F8_IR_t=F8_IR_t,
-                N_TILES_A=N_TILES_A,
+                N_TILES_A=_nta,
                 N_TILES_B=_ntb,
-                N_ACCUMS=N_TILES_A * _ntb,
+                N_ACCUMS=_nta * _ntb,
                 N_LDS_STEPS_A=N_LDS_STEPS_A,
                 N_LDS_STEPS_B=N_LDS_STEPS_B,
                 _CS=_CS,
@@ -3869,6 +4127,8 @@ def _compile_grouped_tn_wgrad_4wave(
                 lds=lds,
                 _cm=_cm,
                 _cn=_cn,
+                C_M=_C_M,
+                C_N=_C_N,
                 tile_rot=_TILE_ROT,
                 xcd_aff=_XCD_AFF,
                 xcd_rot=_XCD_ROT,
@@ -3997,7 +4257,7 @@ def _compile_grouped_tn_wgrad_4wave(
                         dict(
                             split_kb0=_kbs,
                             split_kbe=_kbe,
-                            band_row=_readfirstlane_i32(_bnd * fx.Int32(OUT_M)),
+                            band_row=_readfirstlane_i32(_bnd * fx.Int32(_C_M)),
                             bounds=(_r0, _r1),
                             tile_mn=(_gi, _mb, _nb),
                         ),
@@ -4103,8 +4363,8 @@ def _compile_grouped_tn_wgrad_4wave(
             bm_off = _readfirstlane_i32(_bm * fx.Int32(BLOCK_M))
             bn_off = _readfirstlane_i32((_wq - _bm * fx.Int32(N_BLOCKS_N)) * fx.Int32(BLOCK_N))
             col = bn_off + col_l
-            col_ok = col < fx.Int32(OUT_N)
-            off0 = (sub * fx.Int32(_RED_ROWS) + row_l) * fx.Int32(OUT_N) + col
+            col_ok = col < fx.Int32(_C_N)
+            off0 = (sub * fx.Int32(_RED_ROWS) + row_l) * fx.Int32(_C_N) + col
             # Zero trips when no group banked anything, which is every launch whose groups all hold
             # less than two token chunks -- the balanced deploy point included.
             for _jv in range(_wj, _nlive, fx.Int32(_RED_JS)):
@@ -4117,8 +4377,8 @@ def _compile_grouped_tn_wgrad_4wave(
                 # ids cover, re-derived from the same row range.
                 _c0 = _wgrad_chunk_of(_r0, _chr, _NB)
                 _c1 = _wgrad_chunk_of(_readfirstlane_i32(_readlane_i32(_g1, gi)) - fx.Int32(1), _chr, _NB)
-                # Rows past OUT_M fall outside the band SRD (dropped); columns wrap -> col_ok.
-                rs_c = make_row_band_resource(c_base, gi * OUT_M + bm_off, (gi + 1) * OUT_M, OUT_N, 2)
+                # Rows past C_M fall outside the band SRD (dropped); columns wrap -> col_ok.
+                rs_c = make_row_band_resource(c_base, gi * _C_M + bm_off, (gi + 1) * _C_M, _C_N, 2)
                 # The band sweep is COMPILE-TIME: a band the group never wrote is out of SRD and
                 # costs no request, while the written ones have all loads in flight at once. The
                 # first boundary went into C with the leading piece, so bands start one chunk later.
@@ -4131,7 +4391,7 @@ def _compile_grouped_tn_wgrad_4wave(
                     for c in range_constexpr(1, _NB)
                 ]
                 for p in range_constexpr(_RED_ROWS // _RED_RPP):
-                    off = off0 + fx.Int32(p * _RED_RPP * OUT_N)
+                    off = off0 + fx.Int32(p * _RED_RPP * _C_N)
                     parts = [
                         _buffer_ops.buffer_load(
                             rs_c, off, vec_width=_WGRAD_RED_VEC, dtype=_ir_ty, mask=col_ok
@@ -4142,7 +4402,7 @@ def _compile_grouped_tn_wgrad_4wave(
                         # group's chunk span, or one whose boundary fell in the group's last
                         # K-block (an empty slice the GEMM never stored), reads out of bounds.
                         rs_w = make_row_band_resource(
-                            ws_base, bm_off + fx.Int32((c - 1) * OUT_M), c * OUT_M, OUT_N, 2
+                            ws_base, bm_off + fx.Int32((c - 1) * _C_M), c * _C_M, _C_N, 2
                         )
                         parts.append(
                             _buffer_ops.buffer_load(
@@ -4329,7 +4589,19 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
     return cands
 
 
-def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_traverse=False):
+def _autotune_wgrad_dispatch(
+    OUT_M,
+    OUT_N,
+    G,
+    out_fp16,
+    cbsz,
+    blgp,
+    args,
+    i64_traverse=False,
+    m_real=0,
+    n_real=0,
+    c_tight=False,
+):
     """Race the wgrad candidates and cache per static (OUT_M,OUT_N,G,dtype,i64), never per
     m_total. The synthetic scoring load is balanced and static-shape only, CUDA-graph safe."""
 
@@ -4384,6 +4656,9 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
             xcd_aff=bool(aff),
             half_bnd=half,
             split_k=split,
+            m_real=m_real,
+            n_real=n_real,
+            c_tight=c_tight,
         )
 
     # Correctness reference: the first 4-wave candidate; masked kernel only as a compile/NaN fallback for i64 huge shapes.
@@ -4404,6 +4679,8 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
                 prod, prod_tag = cand, f"4wave.gm{gm0}.gn{gn0}.x{xcd0}.a{aff0}"
         except Exception:
             prod = None
+    if prod is None and c_tight:
+        raise RuntimeError("wgrad c_tight needs the 4-wave body; the masked fallback keeps OUT_N")
     if prod is None:  # i64 huge shape or 4-wave failed to compile/produced NaN -> masked ref
         _masked = _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 1, i64_traverse=i64_traverse)
 
@@ -4461,20 +4738,37 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     group_offs: "torch.Tensor",
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = -1,
+    m_real: "int | None" = None,
+    n_real: "int | None" = None,
+    c_tight: bool = False,
 ) -> "torch.Tensor":
     """FlyDSL per-tensor variable-K grouped fp8 GEMM (wgrad), matching the Triton entry.
     C[g] = lhs[g]^T @ rhs[g] * lhs_scale * rhs_scale, out [G, OUT_M, OUT_N]; group_offs [G+1]
-    int splits M. The caller (backend) has already applied the trans_c lhs/rhs swap."""
+    int splits M. The caller (backend) has already applied the trans_c lhs/rhs swap.
+    ``m_real`` / ``n_real`` (< OUT_M / OUT_N) mark the lhs' / rhs' trailing columns as pure
+    storage padding: the kernel keeps OUT_M/OUT_N as the OPERAND pitches but only computes and
+    stores up to the real extent, so the caller must slice the output to [:, :m_real, :n_real]
+    (the pad rows/columns come back untouched). ``c_tight`` additionally moves C onto those real
+    extents, returning a contiguous [G, m_real, n_real] that needs no slice -- the padded form
+    can only be handed on as a strided view, which autograd clones into .grad."""
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0], f"M_total mismatch lhs={lhs.shape[0]} rhs={rhs.shape[0]}"
     OUT_M = lhs.shape[1]
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out2d = torch.empty((G * OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
-    out = out2d.view(G, OUT_M, OUT_N)
+    _m_real = int(m_real) if m_real and int(m_real) < OUT_M else 0
+    _n_real = int(n_real) if n_real and int(n_real) < OUT_N else 0
+
+    _tight = bool(c_tight) and (_m_real or _n_real) > 0
+    C_M = (_m_real or OUT_M) if _tight else OUT_M
+    C_N = (_n_real or OUT_N) if _tight else OUT_N
+    out2d = torch.empty((G * C_M, C_N), device=lhs.device, dtype=out_dtype)
+    out = out2d.view(G, C_M, C_N)
     # Split-K slice partials land in a persistent scratch; the reduce kernel folds them into C.
-    ws = _wgrad_split_ws(OUT_M, OUT_N, G, lhs.device, out_dtype)
+    ws = _wgrad_split_ws(
+        OUT_M, OUT_N, G, lhs.device, out_dtype, m_real=_m_real, n_real=_n_real, c_tight=_tight
+    )
     # kernel reads group_offs as int64 low-words via a free int32-view (no .to(int32) cast).
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go32 = _go64.view(torch.int32)
@@ -4491,14 +4785,20 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
 
     M_total = lhs.shape[0]
     i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
-    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr)
+    # The real extents change the boundary bodies, so they are part of the autotune key.
+    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr, _m_real, _n_real, _tight)
     # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view). m_total = the contraction
     # length, a plain SHAPE (the same one the i64 test reads): the kernel cuts its token-chunk grid
     # out of it, never looking at the offset table's CONTENT.
     wargs = (lhs_i8, rhs_i8, out2d, lsf, rsf, go32, ws, M_total, stream)
     entry = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if entry is None:
-        entry = [_autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, i64_tr), None]
+        entry = [
+            _autotune_wgrad_dispatch(
+                OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, i64_tr, _m_real, _n_real, _tight
+            ),
+            None,
+        ]
         _GROUPED_WGRAD_AT_CACHE[at_key] = entry
     raw, compiled = entry
     # Mode-split, same as the forward entry: CUDA-graph capture takes the raw @flyc.jit closure,

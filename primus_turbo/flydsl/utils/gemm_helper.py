@@ -196,7 +196,19 @@ def swizzle_128(row, col, width=128):
     return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
+def c_pair_row_perm(row):
+    """Row permutation that feeds StoreCPerTensor.store_paired: inside every 32-row block, LDS
+    row 16*t + m carries operand row 2*m + t, so the two n-fragments one lane reads (t = 0, 1)
+    are ADJACENT output columns. It is an involution on each 32-row block, so a block still
+    spans 32 rows and the LDS pool boundaries stay where they are."""
+    return (row // 32) * 32 + (row % 16) * 2 + (row % 32) // 16
+
+
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled, row_perm=False):
+    """Per-lane global element offsets for one operand's g2s rounds. ``row_perm`` fetches
+    ``c_pair_row_perm``'s row for each LDS row instead of the row itself; the XOR bank key still
+    keys off the LDS row, so the s2r read side is bit-identical either way."""
+    assert not (preshuffled and row_perm)
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
@@ -214,7 +226,7 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
             row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
             col = (lane_id % 8) * 16
             r, c = swizzle_128(row, col)
-            offsets.append(r * K + c)
+            offsets.append((c_pair_row_perm(r) if const_expr(row_perm) else r) * K + c)
     return offsets
 
 
@@ -604,6 +616,26 @@ def _readlane_i32(v, lane):
     return ArithValue(_res_of(rocdl.readlane(res=raw.type, src=raw, lane=lane)))
 
 
+def permlane16_swap_b32(a, b):
+    """One ``v_permlane16_swap_b32`` over a pair of 32-bit lane values (any type -- an f32 or a
+    packed bf16x2). Writing a wave's four 16-lane rows as r0..r3, the instruction exchanges the
+    ODD rows of the first operand with the EVEN rows of the second, so the pair comes back as
+        (a.r0, b.r0, a.r2, b.r2)  and  (a.r1, b.r1, a.r3, b.r3).
+    Each result therefore carries ONE row of each operand inside every 32-lane half. One VALU,
+    no LDS, no byte select and no DPP hazard -- see ``StoreCPerTensor.store_row_merge``. Both
+    results come back in the first operand's type."""
+    ra = _raw(a)
+    st = _llvm.StructType.get_literal([T.i32, T.i32])
+    res = rocdl.permlane16_swap(
+        res=st,
+        old=_llvm.bitcast(T.i32, ra),
+        src=_llvm.bitcast(T.i32, _raw(b)),
+        fi=False,
+        bound_control=False,
+    )
+    return [_llvm.bitcast(ra.type, _llvm.extractvalue(T.i32, res, [k])) for k in (0, 1)]
+
+
 def _wave_count_le_i32(v, bound):
     """Number of lanes whose per-lane i32 is <= the wave-uniform bound. One ballot plus one
     s_bcnt1; on a monotone table this is the first lane above bound, an O(1) stand-in for a
@@ -808,6 +840,86 @@ class StoreCPerTensor:
                         cache_modifier=self.store_aux,
                         offset_is_bytes=True,
                     )
+
+    def store_paired(self, c_frag, base_row, base_col):
+        """Paired twin of store(): the g2s permuted this operand's rows (c_pair_row_perm) so the
+        two n-fragments a lane holds for one output row are ADJACENT columns. Each row then takes
+        one dword store instead of two shorts, so a write request covers 64 B of the row instead
+        of 32 B -- the request granularity, hence half the write requests for the same bytes.
+        Legal when c_cols is even: every pair is then aligned, which both keeps the address
+        naturally aligned and makes the first column's own bound the whole pair's OOB predicate."""
+        assert not (self.trans or self.row_addr) and self.n_tiles_b % 2 == 0
+        scale = self._scale()
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        for ti in range_constexpr(self.n_tiles_a):
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
+            for tj in range_constexpr(self.n_tiles_b // 2):
+                col = base_col + 2 * (tj * 16 + self.lane_id % 16)
+                col_valid = None if self.col_safe else col < self.c_cols
+                pair = [Vec(c_frag[self.c_idx_fn(ti, 2 * tj + t)]) for t in range_constexpr(2)]
+                if self.scaled:
+                    pair = [v * scale for v in pair]
+                for i in range_constexpr(4):
+                    vals = [v[i] for v in pair]
+                    if self.elem_fn is not None:
+                        vals = [self.elem_fn(v) for v in vals]  # bias/act epilogue node chain
+                    # One v_cvt_pk for the column pair, then one store for both.
+                    val = Vec.from_elements(vals, fx.Float32).to(self.out_ty)
+                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
+                    _buffer_ops.buffer_store(
+                        val, rsrc, off, mask=col_valid, cache_modifier=self.store_aux, offset_is_bytes=True
+                    )
+
+    def store_row_merge(self, c_frag, base_row, base_col):
+        """Row-merged twin of store() for a kernel whose output column is the operand's FAST axis
+        (NN dgrad), where store_paired's feed-side address permutation cannot reach: a 16 B g2s
+        chunk is 16 whole output columns and ds_read_b64_tr_b8 hands lane m column m of whichever
+        chunk the group addressed, so no address permutation can make a lane's two n-fragments
+        adjacent columns.
+
+        Instead one ``permlane16_swap_b32`` per pair moves the two n-fragments into the SAME
+        32-lane half, so each store's 32 lanes cover ONE output row's whole 64 B span -- the
+        write-request granularity -- instead of 16 lanes covering 32 B of each of 4 rows. Same
+        bytes, same store count, HALF the write requests. Every emitted (row, column) pair is the
+        one store() emits, so the output is bit-identical.
+
+        The swap rides a PACKED pair of rows, which is what makes it cheaper than the scalar path
+        it replaces: the scalar path emits one v_cvt_pk per value and throws half of each result
+        away, so packing two rows per convert pays for the cross-lane op and then some."""
+        assert not (self.trans or self.row_addr) and self.n_tiles_b % 2 == 0
+        scale = self._scale()
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        # Post-swap map: the 32-lane half picks the row group, the 16-lane row inside it picks
+        # which n-fragment's columns the lane now holds.
+        row_half = (self.lane_id // 32) * 8
+        col_frag = (self.lane_id // 16) % 2
+        for ti in range_constexpr(self.n_tiles_a):
+            for tj in range_constexpr(self.n_tiles_b // 2):
+                col = base_col + (2 * tj + col_frag) * 16 + self.lane_id % 16
+                col_valid = None if self.col_safe else col < self.c_cols
+                pair = [Vec(c_frag[self.c_idx_fn(ti, 2 * tj + t)]) for t in range_constexpr(2)]
+                if self.scaled:
+                    pair = [v * scale for v in pair]
+                for ip in range_constexpr(2):  # the row pair (2*ip, 2*ip+1) sharing one convert
+                    pk = []
+                    for v in pair:
+                        vals = [v[2 * ip + h] for h in range_constexpr(2)]
+                        if self.elem_fn is not None:
+                            vals = [self.elem_fn(x) for x in vals]  # bias/act epilogue node chain
+                        pk.append(Vec.from_elements(vals, fx.Float32).to(self.out_ty))
+                    # The two results differ only in which row pair of the group they carry.
+                    for d, dw in enumerate(permlane16_swap_b32(*pk)):
+                        dw = Vec(dw)
+                        for h in range_constexpr(2):
+                            row = ti * 16 + row_half + 4 * d + 2 * ip + h
+                            _buffer_ops.buffer_store(
+                                dw[h],
+                                rsrc,
+                                (row * self.c_cols + col) * 2,
+                                mask=col_valid,
+                                cache_modifier=self.store_aux,
+                                offset_is_bytes=True,
+                            )
 
     def _store_trans(self, c_frag, base_row, base_col, scale):
         """Transposed twin of store() for the A/B-swapped wgrad boundary body: c_frag holds
@@ -1208,7 +1320,13 @@ class S2RLoaderTr:
             base_i32 = base_i32 + base_off
         I = self.lane_id // 16
         L_in_sg = self.lane_id % 16
-        RS = self.round_stride  # c0->c2 / c1->c3 jump (one K-sub-round)
+        # c0->c2 / c1->c3 (+64 K-rows) as ONE immediate. _ptr_off's W/r_step pair counts
+        # chunk_stride units, so the true jump is (width // 16) * chunk_stride and round_stride
+        # only matches it when n_waves == width // 16. A caller whose two operands share ONE
+        # loader config is exact either way -- the miss is the SAME K permutation on both sides
+        # and the contraction sums over K -- but giving the operands DIFFERENT widths needs the
+        # derived jump, or it silently pairs mismatched K rows.
+        RS = self.round_stride
         if self.inline_asm:
             p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(0, tile_i, I, L_in_sg)))
             p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(1, tile_i, I, L_in_sg)))

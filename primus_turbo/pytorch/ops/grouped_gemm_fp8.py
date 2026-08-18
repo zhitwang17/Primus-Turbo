@@ -447,7 +447,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             # the quant kernel), so out[:, N:Np] come out zero and are sliced off; the dgrad NN
             # contraction over N stays exact (0*anything=0). The padN branch is the campaign's
             # optimization target; the padK branch (use_padn=False) is the frozen incumbent.
-            use_padn = _PADN_ENABLED
+            # ``ops.grouped_gemm_fp8`` resolves to this module's re-exported entry function (the
+            # package __init__ star-import shadows the submodule attribute), so callers that flip
+            # the flag through that name land on the function object; read both.
+            use_padn = _PADN_ENABLED or getattr(grouped_gemm_fp8, "_PADN_ENABLED", False)
             n_real = b.shape[1]  # HIDDEN before padN
             a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
             b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype, pad_n=use_padn)  # [G, (Np|N), Kp]
@@ -460,9 +463,11 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 trans_b=True,
                 out_dtype=out_dtype,
                 num_cu=(num_cu if num_cu is not None else -1),
-            )  # [M, Np] if padN else [M, N]
-            if use_padn:
-                out = out[:, :n_real].contiguous()  # [M, N]
+                # padN: the weight's N pad is storage only. The GEMM keeps b_q's padded row
+                # pitch but iterates the real N, so out comes back contiguous [M, N] with no
+                # pad column-tile computed and no un-pad slice.
+                n_real=(n_real if use_padn else None),
+            )  # [M, N]
             ctx.save_for_backward(a_q, b_q, a_sc, b_sc, group_lens, go)
             ctx.trans_a = False
             ctx.trans_b = trans_b
@@ -545,60 +550,118 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         # padN: the saved weight b_fp8 is [G, Np, Kp] (HIDDEN padded to Np). dgrad NN contracts
         # grad_out's last dim against b_fp8's penultimate dim, so grad_out must be widened N->Np.
         # The pad columns are zero (and b's pad rows are exact zero), so the extra contractions add
-        # exact 0 -> grad_a is unchanged; grad_b picks up Np rows that are sliced back to N.
-        if n_pad_real is not None:
-            np_dim = b_fp8.shape[-2]
-            if grad_out.shape[-1] < np_dim:
-                grad_out = torch.nn.functional.pad(grad_out, (0, np_dim - grad_out.shape[-1])).contiguous()
-
+        # exact 0 -> grad_a is unchanged.
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=-1,
-            block_size=ctx.config.block_size,
-            group_lens=group_lens,
-        )
+        if n_pad_real is not None:
+            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+                quantize_fp8_tensorwise_pad_impl,
+            )
 
-        grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.qdata,
-            b_fp8,
-            quantized_grad_out.scale_inv,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
-        )
+            # The cast-and-pad quant already widens the last dim to ceil128(N) == Np, so the
+            # N->Np widening rides along inside the quant kernel: no F.pad staging buffer.
+            go_qdata, go_scale_inv = quantize_fp8_tensorwise_pad_impl(grad_out, grad_out_dtype)
+            assert go_qdata.shape[-1] == b_fp8.shape[-2]
+        else:
+            quantized_grad_out = QuantizedTensor.quantize(
+                grad_out,
+                grad_out_dtype,
+                ctx.config.granularity,
+                axis=-1,
+                block_size=ctx.config.block_size,
+                group_lens=group_lens,
+            )
+            go_qdata, go_scale_inv = quantized_grad_out.qdata, quantized_grad_out.scale_inv
 
-        grad_b = grouped_gemm_fp8_variable_k_impl(
-            a_fp8,
-            quantized_grad_out.qdata,
-            a_scale_inv,
-            quantized_grad_out.scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=not ctx.trans_a,
-            trans_b=False,
-            trans_c=ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
-        )
+        # padN runs both backward GEMMs on the flydsl backend; the padK incumbent stays on
+        # triton. At this shape flydsl issues ~8% more MFMA in ~26% fewer cycles (MfmaUtil 63%
+        # vs 47%). It derives every operand stride from shape, so it takes the FULL padded
+        # operands and emits padded extents -- the real extents come back as zero-copy strided
+        # views, exact because the weight's pad rows and grad_out's pad columns are zero.
+        bwd_backend = (BackendType.FLYDSL if n_pad_real is not None else BackendType.TRITON).value
 
-        if k_pad_real is not None:
+        if n_pad_real is not None:
+            # Same flydsl NN dgrad the FLYDSL backend would pick, entered directly so b's K-pad
+            # can be declared: b_fp8 is [G, Np, Kp] and only its first K columns are real, so
+            # telling the kernel keeps Kp as b's row pitch but shrinks the last N-block's
+            # boundary body to the real remainder -- the pad costs neither MFMA nor a store and
+            # grad_a comes back contiguous [M, K] with no un-pad slice.
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_tensorwise_flydsl_kernel,
+            )
+
+            grad_a = grouped_gemm_fp8_tensorwise_flydsl_kernel(
+                go_qdata,
+                b_fp8,
+                go_scale_inv,
+                b_scale_inv,
+                group_offs,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                num_cu=(ctx.num_cu if ctx.num_cu is not None else -1),
+                n_real=k_pad_real,
+            )
+        else:
+            grad_a = grouped_gemm_fp8_impl(
+                go_qdata,
+                b_fp8,
+                go_scale_inv,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=bwd_backend,
+            )
+
+        if n_pad_real is not None:
+            # Same flydsl wgrad the FLYDSL backend would pick, entered directly so both pads can be
+            # declared: the trans_c swap makes grad_out the lhs and a the rhs, so grad_b comes out
+            # [G, Np, Kp] while only [:, :N, :K] is ever read back. m_real/n_real keep Np/Kp as the
+            # pitches but shrink each last block's boundary body to the real remainder, so no pad
+            # costs MFMA or a store. c_tight moves C itself onto those extents: slicing a padded C
+            # to a view would do here, but AccumulateGrad clones a non-contiguous grad into .grad,
+            # which measures 376 us of a real backward() step.
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel,
+            )
+
+            grad_b = grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
+                go_qdata,
+                a_fp8,
+                go_scale_inv,
+                a_scale_inv,
+                group_offs,
+                out_dtype=ctx.out_dtype,
+                num_cu=(ctx.num_cu if ctx.num_cu is not None else -1),
+                m_real=n_pad_real,
+                n_real=k_pad_real,
+                c_tight=True,
+            )
+        else:
+            grad_b = grouped_gemm_fp8_variable_k_impl(
+                a_fp8,
+                go_qdata,
+                a_scale_inv,
+                go_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=not ctx.trans_a,
+                trans_b=False,
+                trans_c=ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=bwd_backend,
+            )
+
+        # padN declares both real extents to the two flydsl entries above, so grad_a/grad_b are
+        # already contiguous at them; only the K-pad-only path still has to un-pad on the host.
+        if k_pad_real is not None and n_pad_real is None:
             grad_a = grad_a[:, :k_pad_real].contiguous()
-            if n_pad_real is not None:
-                # grad_b is [G, Np, Kp]; slice back to real [G, N, K].
-                grad_b = grad_b[:, :n_pad_real, :k_pad_real].contiguous()
-            else:
-                grad_b = grad_b[..., :k_pad_real].contiguous()
+            grad_b = grad_b[..., :k_pad_real].contiguous()
 
         return (
             grad_a,  # a
