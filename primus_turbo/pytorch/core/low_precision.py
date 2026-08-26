@@ -195,6 +195,10 @@ class Float4QuantConfig:
     block_size: int = 32
     use_gradient_sr: bool = False
     use_preshuffle: bool = False
+    # Experimental weight-only quantization policy.  Activations and gradients
+    # keep their existing 1D recipes.  The default preserves the production
+    # 32x32 weight-scale behavior.
+    weight_quant_mode: str = "2d_direct"
 
     def __post_init__(self):
         assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
@@ -206,6 +210,12 @@ class Float4QuantConfig:
             f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
         )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
+
+        supported_weight_quant_modes = ("2d_direct", "1d_direct", "1d_qdq")
+        assert self.weight_quant_mode in supported_weight_quant_modes, (
+            f"weight_quant_mode must be one of {supported_weight_quant_modes}, "
+            f"got {self.weight_quant_mode!r}"
+        )
 
         mx_support_scale_dtype = ScaleDtype.E8M0
         assert self.scale_dtype == mx_support_scale_dtype, (

@@ -12,6 +12,7 @@ import torch
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
+    Float4QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
@@ -19,7 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float4_e2m1fn_x2,
     float8_e4m3,
 )
-from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, create_quantized_weight
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
@@ -33,6 +34,46 @@ SKIP_MXFP4 = pytest.mark.skipif(not MXFP4_SUPPORT, reason="MXFP4 not supported o
 
 DEVICE = "cuda"
 M, N = 256, 512
+
+
+def test_float4_weight_quant_mode_validation():
+    for mode in ("2d_direct", "1d_direct", "1d_qdq"):
+        assert Float4QuantConfig(weight_quant_mode=mode).weight_quant_mode == mode
+    with pytest.raises(AssertionError, match="weight_quant_mode"):
+        Float4QuantConfig(weight_quant_mode="unsupported")
+
+
+@SKIP_MXFP4
+@pytest.mark.parametrize("mode", ["2d_direct", "1d_direct", "1d_qdq"])
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_create_quantized_weight_modes_match_raw_pair(mode, preshuffle):
+    from primus_turbo.pytorch.ops.quantization import quantize_fp4_weight_with_trans
+
+    torch.manual_seed(42)
+    weight = torch.randn((256, 512), dtype=torch.bfloat16, device=DEVICE)
+    config = Float4QuantConfig(weight_quant_mode=mode, use_preshuffle=preshuffle)
+    row, col = create_quantized_weight(
+        weight,
+        float4_e2m1fn_x2,
+        config,
+        need_weight_transpose_cache=True,
+    )
+    raw_row, raw_row_scale, raw_col, raw_col_scale = quantize_fp4_weight_with_trans(
+        weight,
+        float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP4_BLOCK_SIZE,
+        weight_quant_mode=mode,
+        use_preshuffle=preshuffle,
+    )
+    torch.testing.assert_close(row.qdata.view(torch.uint8), raw_row.view(torch.uint8), rtol=0, atol=0)
+    torch.testing.assert_close(
+        row.scale_inv.view(torch.uint8), raw_row_scale.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(col.qdata.view(torch.uint8), raw_col.view(torch.uint8), rtol=0, atol=0)
+    torch.testing.assert_close(
+        col.scale_inv.view(torch.uint8), raw_col_scale.view(torch.uint8), rtol=0, atol=0
+    )
 
 
 def _make_quantized_tensor(

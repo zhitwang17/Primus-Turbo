@@ -25,7 +25,10 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
     gemm_fp4_accum_impl,
     gemm_fp4_impl,
 )
-from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
+from primus_turbo.pytorch.ops.quantization import (
+    quantize_fp4_weight_with_trans,
+    quantize_fp4_with_trans,
+)
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, _setup_fused_grad_accum
 
 __all__ = ["gemm_fp4"]
@@ -146,15 +149,16 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 scaling_recipe_for_trans=a_t_scaling_recipe,
             )
 
+        weight_use_2d = config.weight_quant_mode == "2d_direct"
         b_scaling_recipe = ScalingRecipe(
-            use_2d_block=True,
+            use_2d_block=weight_use_2d,
             use_sr=False,
             use_rht=False,
             shuffle_scale=preshuffle,
             shuffle_out=preshuffle,
         )
         b_t_scaling_recipe = ScalingRecipe(
-            use_2d_block=True,
+            use_2d_block=weight_use_2d,
             use_sr=False,
             use_rht=False,
             shuffle_scale=preshuffle,
@@ -164,6 +168,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
             if b_t is None:
+                if config.weight_quant_mode == "1d_direct":
+                    raise ValueError(
+                        "1d_direct pre-quantized weights require data_t; deriving it from data.dequantize() "
+                        "would silently change the mode to 1d_qdq"
+                    )
+                if preshuffle:
+                    raise ValueError("preshuffled pre-quantized weights require data_t")
                 b_t = QuantizedTensor.quantize(
                     b.dequantize(),
                     b.real_dtype,
@@ -174,13 +185,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 )
             b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
-            b_row, b_row_scale, b_col, b_col_scale = quantize_fp4_with_trans(
+            b_row, b_row_scale, b_col, b_col_scale = quantize_fp4_weight_with_trans(
                 b,
                 dest_dtype,
                 config.granularity,
                 block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-                scaling_recipe_for_trans=b_t_scaling_recipe,
+                weight_quant_mode=config.weight_quant_mode,
+                use_preshuffle=preshuffle,
             )
 
         # NT layout

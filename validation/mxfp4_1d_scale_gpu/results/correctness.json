@@ -1,0 +1,283 @@
+{
+  "environment": {
+    "timestamp_unix": 1787752514.222975,
+    "repo": "/home/zhitwang/primus-turbo-branches/mxfp4-1d-scale-gpu-validation",
+    "extension": "/home/zhitwang/primus-turbo/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so",
+    "torch": "2.8.0+rocm7.2.2.git7f079cbb",
+    "rocm": "7.2.53211-671d39a71e",
+    "device": "",
+    "device_total_memory": 309220868096
+  },
+  "requested_phase": "correctness",
+  "correctness": {
+    "cases": [
+      {
+        "name": "dense_synthetic",
+        "shape": [
+          256,
+          4096
+        ],
+        "seed": 101,
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 8.900078682927415e-06,
+              "snr_db": 18.458192883018768,
+              "cosine": 0.9928551912307739,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 8.900078682927415e-06,
+              "snr_db": 18.458192883018768,
+              "cosine": 0.9928551912307739,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 7.987950993992854e-06,
+              "snr_db": 18.927777426169584,
+              "cosine": 0.9935829043388367,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 7.98848213889869e-06,
+              "snr_db": 18.92748865920907,
+              "cosine": 0.993582546710968,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 1.7269485397264361e-06,
+              "snr_db": 25.547072325062594,
+              "cosine": 0.9986060857772827,
+              "max_abs_error": 0.0078125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 7.987950993992854e-06,
+              "snr_db": 18.927777426169584,
+              "cosine": 0.9935829043388367,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 8.852945029502735e-06,
+              "snr_db": 18.481253668631815,
+              "cosine": 0.992895781993866,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 8.640781743451953e-07,
+              "snr_db": 28.554335935156953,
+              "cosine": 0.999305784702301,
+              "max_abs_error": 0.0078125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.08365058898925781
+      },
+      {
+        "name": "moe_gate_up_synthetic",
+        "shape": [
+          4,
+          576,
+          2880
+        ],
+        "seed": 103,
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 6.809854767197976e-06,
+              "snr_db": 17.691168951509653,
+              "cosine": 0.9914906620979309,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 6.809854767197976e-06,
+              "snr_db": 17.691168951509653,
+              "cosine": 0.9914906620979309,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 5.038064045947976e-06,
+              "snr_db": 18.99991060898244,
+              "cosine": 0.9936873912811279,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 5.039931693318067e-06,
+              "snr_db": 18.998300945757247,
+              "cosine": 0.9936851859092712,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 1.2752572047247668e-06,
+              "snr_db": 24.92951223072989,
+              "cosine": 0.9983931183815002,
+              "max_abs_error": 0.00390625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 5.038064045947976e-06,
+              "snr_db": 18.99991060898244,
+              "cosine": 0.9936873912811279,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 5.678879915649304e-06,
+              "snr_db": 18.479920597414235,
+              "cosine": 0.9928918480873108,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 6.385872097780521e-07,
+              "snr_db": 27.933287930496036,
+              "cosine": 0.9991994500160217,
+              "max_abs_error": 0.00390625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.06297969073057175
+      },
+      {
+        "name": "moe_down_synthetic",
+        "shape": [
+          4,
+          288,
+          2880
+        ],
+        "seed": 107,
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 6.808180387452012e-06,
+              "snr_db": 17.692547377261803,
+              "cosine": 0.9914938807487488,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 6.808180387452012e-06,
+              "snr_db": 17.692547377261803,
+              "cosine": 0.9914938807487488,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 5.032379704061896e-06,
+              "snr_db": 19.005123897454727,
+              "cosine": 0.9936951398849487,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 5.032785793446237e-06,
+              "snr_db": 19.004773456363782,
+              "cosine": 0.993694543838501,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 1.2782759313267889e-06,
+              "snr_db": 24.919813512572155,
+              "cosine": 0.9983893632888794,
+              "max_abs_error": 0.00390625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 5.032379704061896e-06,
+              "snr_db": 19.005123897454727,
+              "cosine": 0.9936951398849487,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 5.6762792155495845e-06,
+              "snr_db": 18.482220416794583,
+              "cosine": 0.9928959012031555,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 6.39733571006218e-07,
+              "snr_db": 27.926068213295867,
+              "cosine": 0.9991980791091919,
+              "max_abs_error": 0.00390625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.06322790682315826
+      }
+    ]
+  },
+  "cache_correctness": {
+    "cases": [
+      {
+        "mode": "2d_direct",
+        "preshuffle": false,
+        "row_codes_equal_raw": true,
+        "row_scales_equal_raw": true,
+        "col_codes_equal_raw": true,
+        "col_scales_equal_raw": true
+      },
+      {
+        "mode": "1d_direct",
+        "preshuffle": false,
+        "row_codes_equal_raw": true,
+        "row_scales_equal_raw": true,
+        "col_codes_equal_raw": true,
+        "col_scales_equal_raw": true
+      },
+      {
+        "mode": "1d_qdq",
+        "preshuffle": false,
+        "row_codes_equal_raw": true,
+        "row_scales_equal_raw": true,
+        "col_codes_equal_raw": true,
+        "col_scales_equal_raw": true
+      },
+      {
+        "mode": "2d_direct",
+        "preshuffle": true,
+        "row_codes_equal_raw": true,
+        "row_scales_equal_raw": true,
+        "col_codes_equal_raw": true,
+        "col_scales_equal_raw": true
+      },
+      {
+        "mode": "1d_direct",
+        "preshuffle": true,
+        "row_codes_equal_raw": true,
+        "row_scales_equal_raw": true,
+        "col_codes_equal_raw": true,
+        "col_scales_equal_raw": true
+      },
+      {
+        "mode": "1d_qdq",
+        "preshuffle": true,
+        "row_codes_equal_raw": true,
+        "row_scales_equal_raw": true,
+        "col_codes_equal_raw": true,
+        "col_scales_equal_raw": true
+      }
+    ]
+  }
+}

@@ -43,7 +43,10 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
-from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans, quantize_fp4_with_trans
+from primus_turbo.pytorch.ops.quantization import (
+    grouped_quantize_fp4_with_trans,
+    quantize_fp4_weight_with_trans,
+)
 from primus_turbo.pytorch.ops.utils import (
     _ensure_contiguous_grad_out,
     _get_dummy_wgrad,
@@ -174,22 +177,28 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             a_col, a_col_scale = quantized_a_t.qdata, quantized_a_t.scale_inv
 
         # --- B: 3D weight (G, N, K). row-wise (rht=F) is the fwd operand; col-wise
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
-        b_t_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        weight_use_2d = config.weight_quant_mode == "2d_direct"
+        b_scaling_recipe = ScalingRecipe(use_2d_block=weight_use_2d)
+        b_t_scaling_recipe = ScalingRecipe(use_2d_block=weight_use_2d)
         if not isinstance(b, QuantizedTensor):
-            b_row, b_row_scale, b_col, b_col_scale = quantize_fp4_with_trans(
+            b_row, b_row_scale, b_col, b_col_scale = quantize_fp4_weight_with_trans(
                 b,
                 float4_e2m1fn_x2,
                 ScalingGranularity.MX_BLOCKWISE,
                 block_size=MXFP4_BLOCK_SIZE,
-                scaling_recipe=b_scaling_recipe,
-                scaling_recipe_for_trans=b_t_scaling_recipe,
+                weight_quant_mode=config.weight_quant_mode,
+                use_preshuffle=False,
             )
         else:
             quantized_b = b
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
 
             if b_t is None:
+                if config.weight_quant_mode == "1d_direct":
+                    raise ValueError(
+                        "1d_direct pre-quantized grouped weights require data_t; deriving it from "
+                        "data.dequantize() would silently change the mode to 1d_qdq"
+                    )
                 quantized_b_t = QuantizedTensor.quantize(
                     quantized_b.dequantize(),
                     quantized_b.real_dtype,

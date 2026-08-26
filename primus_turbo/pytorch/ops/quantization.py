@@ -40,6 +40,7 @@ __all__ = [
     "dequantize_fp8",
     "quantize_fp4",
     "quantize_fp4_with_trans",
+    "quantize_fp4_weight_with_trans",
     "dequantize_fp4",
     "grouped_quantize_fp8",
     "grouped_quantize_fp8_with_trans",
@@ -481,6 +482,95 @@ def quantize_fp4_with_trans(
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+def quantize_fp4_weight_with_trans(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    *,
+    block_size: Optional[int] = None,
+    weight_quant_mode: str = "2d_direct",
+    use_preshuffle: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize an MXFP4 weight into the row/column pair used by GEMM.
+
+    ``2d_direct`` is the production default. ``1d_direct`` independently
+    quantizes both directions from the high-precision weight. ``1d_qdq``
+    implements the ordered experiment ``q(dq(q(w, axis=-1)), axis=-2)``:
+    the column-wise representation is derived from the row-wise FP4 grid.
+
+    The QDQ path deliberately uses an unshuffled intermediate because the
+    public dequantizer consumes the canonical layout.  If preshuffle is
+    requested, only the final GEMM-facing pair is shuffled.
+    """
+    supported_modes = ("2d_direct", "1d_direct", "1d_qdq")
+    if weight_quant_mode not in supported_modes:
+        raise ValueError(f"weight_quant_mode must be one of {supported_modes}, got {weight_quant_mode!r}")
+    if granularity != ScalingGranularity.MX_BLOCKWISE:
+        raise ValueError("MXFP4 weight modes require MX_BLOCKWISE granularity")
+
+    use_2d_block = weight_quant_mode == "2d_direct"
+    final_recipe = ScalingRecipe(
+        use_2d_block=use_2d_block,
+        use_sr=False,
+        use_rht=False,
+        shuffle_scale=use_preshuffle,
+        shuffle_out=use_preshuffle,
+    )
+    if weight_quant_mode != "1d_qdq":
+        return quantize_fp4_with_trans(
+            x,
+            out_dtype,
+            granularity,
+            block_size=block_size,
+            scaling_recipe=final_recipe,
+            scaling_recipe_for_trans=final_recipe,
+        )
+
+    canonical_recipe = ScalingRecipe(use_2d_block=False)
+    row_axis = x.ndim - 1
+    col_axis = x.ndim - 2
+    row_raw, row_scale_raw = quantize_fp4(
+        x,
+        out_dtype,
+        granularity,
+        block_size=block_size,
+        axis=row_axis,
+        scaling_recipe=canonical_recipe,
+    )
+    row_dq = dequantize_fp4(
+        row_raw,
+        x.dtype,
+        granularity,
+        block_size=block_size,
+        axis=row_axis,
+        scale_inv=row_scale_raw,
+        scaling_recipe=canonical_recipe,
+    )
+    row_dq = row_dq[..., : x.shape[-1]].contiguous()
+
+    if use_preshuffle:
+        row, row_scale = quantize_fp4(
+            x,
+            out_dtype,
+            granularity,
+            block_size=block_size,
+            axis=row_axis,
+            scaling_recipe=final_recipe,
+        )
+    else:
+        row, row_scale = row_raw, row_scale_raw
+
+    col, col_scale = quantize_fp4(
+        row_dq,
+        out_dtype,
+        granularity,
+        block_size=block_size,
+        axis=col_axis,
+        scaling_recipe=final_recipe,
+    )
+    return row, row_scale, col, col_scale
 
 
 def dequantize_fp4(

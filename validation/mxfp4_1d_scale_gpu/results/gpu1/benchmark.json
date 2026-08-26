@@ -1,0 +1,167 @@
+{
+  "environment": {
+    "timestamp_unix": 1787753803.644531,
+    "repo": "/home/zhitwang/primus-turbo-branches/mxfp4-1d-scale-gpu-validation",
+    "extension": "/home/zhitwang/primus-turbo/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so",
+    "torch": "2.8.0+rocm7.2.2.git7f079cbb",
+    "rocm": "7.2.53211-671d39a71e",
+    "device": "",
+    "gcn_arch": "gfx950:sramecc+:xnack-",
+    "pci_address": "0000:15:00.0",
+    "device_total_memory": 309220868096
+  },
+  "requested_phase": "benchmark",
+  "benchmark": {
+    "warmup": 20,
+    "repeats_per_group": 100,
+    "groups": 3,
+    "cases": [
+      {
+        "name": "dense_4096x4096",
+        "shape": [
+          4096,
+          4096
+        ],
+        "modes": {
+          "2d_direct": {
+            "group_medians_ms": [
+              0.0366005003452301,
+              0.03722049854695797,
+              0.036620499566197395
+            ],
+            "median_ms": 0.036620499566197395,
+            "p10_ms": 0.0366005003452301,
+            "p90_ms": 0.03722049854695797,
+            "peak_memory_delta_bytes": 17825792,
+            "speedup_vs_2d": 1.0,
+            "latency_change_percent_vs_2d": 0.0
+          },
+          "1d_direct": {
+            "group_medians_ms": [
+              0.03480049967765808,
+              0.03494050167500973,
+              0.0352999996393919
+            ],
+            "median_ms": 0.03494050167500973,
+            "p10_ms": 0.03480049967765808,
+            "p90_ms": 0.0352999996393919,
+            "peak_memory_delta_bytes": 17825792,
+            "speedup_vs_2d": 1.0480816762968588,
+            "latency_change_percent_vs_2d": -4.587588675984067
+          },
+          "1d_qdq": {
+            "group_medians_ms": [
+              0.045060498639941216,
+              0.045380501076579094,
+              0.04540000110864639
+            ],
+            "median_ms": 0.045380501076579094,
+            "p10_ms": 0.045060498639941216,
+            "p90_ms": 0.04540000110864639,
+            "peak_memory_delta_bytes": 51380224,
+            "speedup_vs_2d": 0.8069655181726775,
+            "latency_change_percent_vs_2d": 23.921032247379912
+          }
+        }
+      },
+      {
+        "name": "moe_gate_up_g32",
+        "shape": [
+          32,
+          5760,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "group_medians_ms": [
+              0.44796399772167206,
+              0.4480839967727661,
+              0.44664400815963745
+            ],
+            "median_ms": 0.44796399772167206,
+            "p10_ms": 0.44664400815963745,
+            "p90_ms": 0.4480839967727661,
+            "peak_memory_delta_bytes": 571392000,
+            "speedup_vs_2d": 1.0,
+            "latency_change_percent_vs_2d": 0.0
+          },
+          "1d_direct": {
+            "group_medians_ms": [
+              0.45040398836135864,
+              0.4518444985151291,
+              0.4521445035934448
+            ],
+            "median_ms": 0.4518444985151291,
+            "p10_ms": 0.45040398836135864,
+            "p90_ms": 0.4521445035934448,
+            "peak_memory_delta_bytes": 571392000,
+            "speedup_vs_2d": 0.9914118666793348,
+            "latency_change_percent_vs_2d": 0.8662528268327696
+          },
+          "1d_qdq": {
+            "group_medians_ms": [
+              2.007838487625122,
+              1.9956390261650085,
+              1.9896380305290222
+            ],
+            "median_ms": 1.9956390261650085,
+            "p10_ms": 1.9896380305290222,
+            "p90_ms": 2.007838487625122,
+            "peak_memory_delta_bytes": 2436284416,
+            "speedup_vs_2d": 0.224471455933851,
+            "latency_change_percent_vs_2d": 345.49094041368346
+          }
+        }
+      },
+      {
+        "name": "moe_down_g32",
+        "shape": [
+          32,
+          2880,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "group_medians_ms": [
+              0.2508620023727417,
+              0.25150249898433685,
+              0.25022199749946594
+            ],
+            "median_ms": 0.2508620023727417,
+            "p10_ms": 0.25022199749946594,
+            "p90_ms": 0.25150249898433685,
+            "peak_memory_delta_bytes": 289587200,
+            "speedup_vs_2d": 1.0,
+            "latency_change_percent_vs_2d": 0.0
+          },
+          "1d_direct": {
+            "group_medians_ms": [
+              0.24790199846029282,
+              0.24988199770450592,
+              0.24890249967575073
+            ],
+            "median_ms": 0.24890249967575073,
+            "p10_ms": 0.24790199846029282,
+            "p90_ms": 0.24988199770450592,
+            "peak_memory_delta_bytes": 289587200,
+            "speedup_vs_2d": 1.0078725713865615,
+            "latency_change_percent_vs_2d": -0.7811078116483516
+          },
+          "1d_qdq": {
+            "group_medians_ms": [
+              0.9692089855670929,
+              0.9639489948749542,
+              0.9580689966678619
+            ],
+            "median_ms": 0.9639489948749542,
+            "p10_ms": 0.9580689966678619,
+            "p90_ms": 0.9692089855670929,
+            "peak_memory_delta_bytes": 1218797568,
+            "speedup_vs_2d": 0.26024406240009007,
+            "latency_change_percent_vs_2d": 284.2546841520769
+          }
+        }
+      }
+    ]
+  }
+}

@@ -903,7 +903,7 @@ def create_quantized_weight(
     def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
         if isinstance(quant_config, Float4QuantConfig):
             weight_scaling_recipe = ScalingRecipe(
-                use_2d_block=True,
+                use_2d_block=quant_config.weight_quant_mode == "2d_direct",
                 shuffle_scale=quant_config.use_preshuffle,
                 shuffle_out=quant_config.use_preshuffle,
             )
@@ -916,12 +916,30 @@ def create_quantized_weight(
 
         return weight_scaling_recipe
 
+    weight_recipe = _weight_scaling_recipe(quant_config)
+    qdq_source = None
+    if (
+        isinstance(quant_config, Float4QuantConfig)
+        and quant_config.weight_quant_mode == "1d_qdq"
+        and quant_config.use_preshuffle
+    ):
+        canonical_recipe = ScalingRecipe(use_2d_block=False)
+        canonical_weight = QuantizedTensor.quantize(
+            weight,
+            dest_dtype=dest_dtype,
+            granularity=quant_config.granularity,
+            block_size=quant_config.block_size,
+            scaling_recipe=canonical_recipe,
+            axis=-1,
+        )
+        qdq_source = canonical_weight.dequantize()
+
     quantized_weight = QuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,
         granularity=quant_config.granularity,
         block_size=quant_config.block_size,
-        scaling_recipe=_weight_scaling_recipe(quant_config),
+        scaling_recipe=weight_recipe,
         axis=-1,
     )
 
@@ -941,8 +959,11 @@ def create_quantized_weight(
                 axis=-2,
             )
         elif granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+            col_source = weight
+            if isinstance(quant_config, Float4QuantConfig) and quant_config.weight_quant_mode == "1d_qdq":
+                col_source = qdq_source if qdq_source is not None else quantized_weight.dequantize()
             quantized_weight_t = QuantizedTensor.quantize(
-                weight,
+                col_source,
                 dest_dtype=dest_dtype,
                 granularity=quant_config.granularity,
                 block_size=quant_config.block_size,

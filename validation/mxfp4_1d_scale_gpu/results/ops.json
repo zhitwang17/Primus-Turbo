@@ -1,0 +1,225 @@
+{
+  "environment": {
+    "timestamp_unix": 1787753565.9912028,
+    "repo": "/home/zhitwang/primus-turbo-branches/mxfp4-1d-scale-gpu-validation",
+    "extension": "/home/zhitwang/primus-turbo/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so",
+    "torch": "2.8.0+rocm7.2.2.git7f079cbb",
+    "rocm": "7.2.53211-671d39a71e",
+    "device": "",
+    "device_total_memory": 309220868096
+  },
+  "requested_phase": "ops",
+  "op_correctness": {
+    "dense": {
+      "2d_direct": {
+        "fwd_vs_bf16": {
+          "mse": 0.00106153916567564,
+          "snr_db": 15.834238689354187,
+          "cosine": 0.9868788123130798,
+          "max_abs_error": 0.149658203125
+        },
+        "dgrad_vs_bf16": {
+          "mse": 0.004240994341671467,
+          "snr_db": 15.812003698633923,
+          "cosine": 0.9868065714836121,
+          "max_abs_error": 0.3173828125
+        },
+        "wgrad_vs_bf16": {
+          "mse": 1.589184284210205,
+          "snr_db": 16.04234091430994,
+          "cosine": 0.987488865852356,
+          "max_abs_error": 5.59375
+        }
+      },
+      "1d_direct": {
+        "fwd_vs_bf16": {
+          "mse": 0.0010137483477592468,
+          "snr_db": 16.03429731712703,
+          "cosine": 0.9874669313430786,
+          "max_abs_error": 0.145751953125
+        },
+        "dgrad_vs_bf16": {
+          "mse": 0.004056606441736221,
+          "snr_db": 16.005051869250444,
+          "cosine": 0.9873787760734558,
+          "max_abs_error": 0.3173828125
+        },
+        "wgrad_vs_bf16": {
+          "mse": 1.589184284210205,
+          "snr_db": 16.04234091430994,
+          "cosine": 0.987488865852356,
+          "max_abs_error": 5.59375
+        }
+      },
+      "1d_qdq": {
+        "fwd_vs_bf16": {
+          "mse": 0.0010137483477592468,
+          "snr_db": 16.03429731712703,
+          "cosine": 0.9874669313430786,
+          "max_abs_error": 0.145751953125
+        },
+        "dgrad_vs_bf16": {
+          "mse": 0.004255922511219978,
+          "snr_db": 15.796743508514101,
+          "cosine": 0.9867639541625977,
+          "max_abs_error": 0.3095703125
+        },
+        "wgrad_vs_bf16": {
+          "mse": 1.589184284210205,
+          "snr_db": 16.04234091430994,
+          "cosine": 0.987488865852356,
+          "max_abs_error": 5.59375
+        }
+      }
+    },
+    "dense_preshuffle": {
+      "status": "not_run",
+      "reason": "Primus-Turbo requires amd-aiter==0.1.14.post1 for this operator. Install it with:\n  pip install \"amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.14.post1\"",
+      "cache_layout_validation": "passed in cache_correctness for all three modes"
+    },
+    "grouped": [
+      {
+        "routing": "balanced",
+        "group_lens": [
+          64,
+          64,
+          64,
+          64
+        ],
+        "modes": {
+          "2d_direct": {
+            "fwd_vs_bf16": {
+              "mse": 0.0010586290154606104,
+              "snr_db": 15.783272732836249,
+              "cosine": 0.9867311120033264,
+              "max_abs_error": 0.1572265625
+            },
+            "dgrad_vs_bf16": {
+              "mse": 0.004238675814121962,
+              "snr_db": 15.735639889275985,
+              "cosine": 0.9865934252738953,
+              "max_abs_error": 0.296875
+            },
+            "wgrad_vs_bf16_nonempty": {
+              "mse": 0.4011419713497162,
+              "snr_db": 16.012395286253113,
+              "cosine": 0.9874036312103271,
+              "max_abs_error": 3.34375
+            }
+          },
+          "1d_direct": {
+            "fwd_vs_bf16": {
+              "mse": 0.001006824430078268,
+              "snr_db": 16.001173215365114,
+              "cosine": 0.9873737692832947,
+              "max_abs_error": 0.14599609375
+            },
+            "dgrad_vs_bf16": {
+              "mse": 0.004034026525914669,
+              "snr_db": 15.950554410912773,
+              "cosine": 0.9872331619262695,
+              "max_abs_error": 0.29833984375
+            },
+            "wgrad_vs_bf16_nonempty": {
+              "mse": 0.4011419713497162,
+              "snr_db": 16.012395286253113,
+              "cosine": 0.9874036312103271,
+              "max_abs_error": 3.34375
+            }
+          },
+          "1d_qdq": {
+            "fwd_vs_bf16": {
+              "mse": 0.001006824430078268,
+              "snr_db": 16.001173215365114,
+              "cosine": 0.9873737692832947,
+              "max_abs_error": 0.14599609375
+            },
+            "dgrad_vs_bf16": {
+              "mse": 0.004265632480382919,
+              "snr_db": 15.70810756045802,
+              "cosine": 0.9865132570266724,
+              "max_abs_error": 0.322265625
+            },
+            "wgrad_vs_bf16_nonempty": {
+              "mse": 0.4011419713497162,
+              "snr_db": 16.012395286253113,
+              "cosine": 0.9874036312103271,
+              "max_abs_error": 3.34375
+            }
+          }
+        }
+      },
+      {
+        "routing": "zero_even_odd",
+        "group_lens": [
+          0,
+          255,
+          256,
+          512
+        ],
+        "modes": {
+          "2d_direct": {
+            "fwd_vs_bf16": {
+              "mse": 0.001065087621100247,
+              "snr_db": 15.729686484922658,
+              "cosine": 0.986563503742218,
+              "max_abs_error": 0.1484375
+            },
+            "dgrad_vs_bf16": {
+              "mse": 0.004247625358402729,
+              "snr_db": 15.757686946926825,
+              "cosine": 0.9866490960121155,
+              "max_abs_error": 0.318359375
+            },
+            "wgrad_vs_bf16_nonempty": {
+              "mse": 2.124708652496338,
+              "snr_db": 16.050849845008667,
+              "cosine": 0.9875200986862183,
+              "max_abs_error": 8.375
+            }
+          },
+          "1d_direct": {
+            "fwd_vs_bf16": {
+              "mse": 0.0010089470306411386,
+              "snr_db": 15.9648561912187,
+              "cosine": 0.987267017364502,
+              "max_abs_error": 0.14501953125
+            },
+            "dgrad_vs_bf16": {
+              "mse": 0.004025991540402174,
+              "snr_db": 15.990420415814036,
+              "cosine": 0.9873412251472473,
+              "max_abs_error": 0.3056640625
+            },
+            "wgrad_vs_bf16_nonempty": {
+              "mse": 2.124708652496338,
+              "snr_db": 16.050849845008667,
+              "cosine": 0.9875200986862183,
+              "max_abs_error": 8.375
+            }
+          },
+          "1d_qdq": {
+            "fwd_vs_bf16": {
+              "mse": 0.0010089470306411386,
+              "snr_db": 15.9648561912187,
+              "cosine": 0.987267017364502,
+              "max_abs_error": 0.14501953125
+            },
+            "dgrad_vs_bf16": {
+              "mse": 0.004243915900588036,
+              "snr_db": 15.761481304424754,
+              "cosine": 0.9866651892662048,
+              "max_abs_error": 0.3125
+            },
+            "wgrad_vs_bf16_nonempty": {
+              "mse": 2.124708652496338,
+              "snr_db": 16.050849845008667,
+              "cosine": 0.9875200986862183,
+              "max_abs_error": 8.375
+            }
+          }
+        }
+      }
+    ]
+  }
+}

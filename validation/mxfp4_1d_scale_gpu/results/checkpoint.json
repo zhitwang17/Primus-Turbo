@@ -1,0 +1,1736 @@
+{
+  "environment": {
+    "timestamp_unix": 1787752798.6701205,
+    "repo": "/home/zhitwang/primus-turbo-branches/mxfp4-1d-scale-gpu-validation",
+    "extension": "/home/zhitwang/primus-turbo/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so",
+    "torch": "2.8.0+rocm7.2.2.git7f079cbb",
+    "rocm": "7.2.53211-671d39a71e",
+    "device": "",
+    "device_total_memory": 309220868096
+  },
+  "requested_phase": "checkpoint",
+  "checkpoint_correctness": {
+    "checkpoint": "/shareddata/sapmajum/models/gpt-oss-20b",
+    "samples": [
+      {
+        "kind": "dense_bf16",
+        "tensor": "model.layers.0.self_attn.o_proj.weight",
+        "selection": {
+          "rows": [
+            544,
+            672
+          ],
+          "columns": [
+            0,
+            4096
+          ]
+        },
+        "shape": [
+          128,
+          4096
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 1.336834338871995e-05,
+              "snr_db": 12.63213740171571,
+              "cosine": 0.9728943109512329,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_source": {
+              "mse": 1.336834338871995e-05,
+              "snr_db": 12.63213740171571,
+              "cosine": 0.9728943109512329,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 3.1551230676996056e-06,
+              "snr_db": 18.902750289360835,
+              "cosine": 0.9935421943664551,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_source": {
+              "mse": 5.286766281642485e-06,
+              "snr_db": 16.661012213379053,
+              "cosine": 0.9891908764839172,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 3.849864697258454e-06,
+              "snr_db": 17.988214695337568,
+              "cosine": 0.99208664894104,
+              "max_abs_error": 0.03125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 3.1551230676996056e-06,
+              "snr_db": 18.902750289360835,
+              "cosine": 0.9935421943664551,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_source": {
+              "mse": 6.504143129859585e-06,
+              "snr_db": 15.761012430407371,
+              "cosine": 0.9867388010025024,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 3.2133298191183712e-06,
+              "snr_db": 18.773116318927613,
+              "cosine": 0.9934308528900146,
+              "max_abs_error": 0.03125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.14701271057128906
+      },
+      {
+        "kind": "dense_bf16",
+        "tensor": "model.layers.12.self_attn.o_proj.weight",
+        "selection": {
+          "rows": [
+            256,
+            384
+          ],
+          "columns": [
+            0,
+            4096
+          ]
+        },
+        "shape": [
+          128,
+          4096
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.00028694741195067763,
+              "snr_db": 15.546849345857545,
+              "cosine": 0.9861538410186768,
+              "max_abs_error": 0.25
+            },
+            "col_vs_source": {
+              "mse": 0.00028694741195067763,
+              "snr_db": 15.546849345857545,
+              "cosine": 0.9861538410186768,
+              "max_abs_error": 0.25
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.00013080005010124296,
+              "snr_db": 18.958793363385062,
+              "cosine": 0.9936273694038391,
+              "max_abs_error": 0.25
+            },
+            "col_vs_source": {
+              "mse": 0.00014676505816169083,
+              "snr_db": 18.45864575660618,
+              "cosine": 0.9928519129753113,
+              "max_abs_error": 0.25
+            },
+            "col_vs_row": {
+              "mse": 5.279541073832661e-05,
+              "snr_db": 22.862244730098304,
+              "cosine": 0.9974165558815002,
+              "max_abs_error": 0.125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.00013080005010124296,
+              "snr_db": 18.958793363385062,
+              "cosine": 0.9936273694038391,
+              "max_abs_error": 0.25
+            },
+            "col_vs_source": {
+              "mse": 0.0001708475174382329,
+              "snr_db": 17.798785741703156,
+              "cosine": 0.9917025566101074,
+              "max_abs_error": 0.25
+            },
+            "col_vs_row": {
+              "mse": 3.916829882655293e-05,
+              "snr_db": 24.158859364637408,
+              "cosine": 0.9981001615524292,
+              "max_abs_error": 0.125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.08453369140625
+      },
+      {
+        "kind": "dense_bf16",
+        "tensor": "model.layers.23.self_attn.o_proj.weight",
+        "selection": {
+          "rows": [
+            1152,
+            1280
+          ],
+          "columns": [
+            0,
+            4096
+          ]
+        },
+        "shape": [
+          128,
+          4096
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.04486393928527832,
+              "snr_db": 17.12305841524274,
+              "cosine": 0.9903098344802856,
+              "max_abs_error": 2.0
+            },
+            "col_vs_source": {
+              "mse": 0.04486393928527832,
+              "snr_db": 17.12305841524274,
+              "cosine": 0.9903098344802856,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.02920703962445259,
+              "snr_db": 18.987157058821943,
+              "cosine": 0.9936676621437073,
+              "max_abs_error": 2.0
+            },
+            "col_vs_source": {
+              "mse": 0.030290938913822174,
+              "snr_db": 18.828905105801557,
+              "cosine": 0.9934330582618713,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.006914950907230377,
+              "snr_db": 25.20198000798998,
+              "cosine": 0.9984914064407349,
+              "max_abs_error": 0.5
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.02920703962445259,
+              "snr_db": 18.987157058821943,
+              "cosine": 0.9936676621437073,
+              "max_abs_error": 2.0
+            },
+            "col_vs_source": {
+              "mse": 0.03358878940343857,
+              "snr_db": 18.38008894322188,
+              "cosine": 0.9927248954772949,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.004377363249659538,
+              "snr_db": 27.187745145191194,
+              "cosine": 0.9990499019622803,
+              "max_abs_error": 0.5
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.06752395629882812
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.0.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 0,
+          "rows": [
+            384,
+            448
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 1.51769154399517e-05,
+              "snr_db": 19.67422339592691,
+              "cosine": 0.994743824005127,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 1.51769154399517e-05,
+              "snr_db": 19.67422339592691,
+              "cosine": 0.994743824005127,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 2.930313485194347e-06,
+              "snr_db": 26.81691770301271,
+              "cosine": 0.9989655613899231,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 2.930313485194347e-06,
+              "snr_db": 26.81691770301271,
+              "cosine": 0.9989655613899231,
+              "max_abs_error": 0.015625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 2.930313485194347e-06,
+              "snr_db": 26.81691770301271,
+              "cosine": 0.9989655613899231,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 2.930313485194347e-06,
+              "snr_db": 26.81691770301271,
+              "cosine": 0.9989655613899231,
+              "max_abs_error": 0.015625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.0.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 15,
+          "rows": [
+            3808,
+            3872
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 1.7639829820836894e-05,
+              "snr_db": 18.87379188294823,
+              "cosine": 0.9936633706092834,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 1.7639829820836894e-05,
+              "snr_db": 18.87379188294823,
+              "cosine": 0.9936633706092834,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 2.6838647499971557e-06,
+              "snr_db": 27.05112952959905,
+              "cosine": 0.9990199208259583,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 2.6838647499971557e-06,
+              "snr_db": 27.05112952959905,
+              "cosine": 0.9990199208259583,
+              "max_abs_error": 0.015625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 2.6838647499971557e-06,
+              "snr_db": 27.05112952959905,
+              "cosine": 0.9990199208259583,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 2.6838647499971557e-06,
+              "snr_db": 27.05112952959905,
+              "cosine": 0.9990199208259583,
+              "max_abs_error": 0.015625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.0.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 31,
+          "rows": [
+            2496,
+            2560
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 1.982980393222533e-05,
+              "snr_db": 18.06498958112291,
+              "cosine": 0.9923436641693115,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 1.982980393222533e-05,
+              "snr_db": 18.06498958112291,
+              "cosine": 0.9923436641693115,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999999403953552,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 2.3909119590825867e-06,
+              "snr_db": 27.252537939212928,
+              "cosine": 0.9990646839141846,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 2.3909119590825867e-06,
+              "snr_db": 27.252537939212928,
+              "cosine": 0.9990646839141846,
+              "max_abs_error": 0.015625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 2.3909119590825867e-06,
+              "snr_db": 27.252537939212928,
+              "cosine": 0.9990646839141846,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 2.3909119590825867e-06,
+              "snr_db": 27.252537939212928,
+              "cosine": 0.9990646839141846,
+              "max_abs_error": 0.015625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.0.mlp.experts.down_proj",
+        "selection": {
+          "expert": 0,
+          "rows": [
+            288,
+            352
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.00016690639313310385,
+              "snr_db": 12.852685565476634,
+              "cosine": 0.9742838144302368,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_source": {
+              "mse": 0.00016690639313310385,
+              "snr_db": 12.852685565476634,
+              "cosine": 0.9742838144302368,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 4.329430157667957e-05,
+              "snr_db": 18.713107906319998,
+              "cosine": 0.9933282136917114,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 4.329430157667957e-05,
+              "snr_db": 18.713107906319998,
+              "cosine": 0.9933282136917114,
+              "max_abs_error": 0.0625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 4.329430157667957e-05,
+              "snr_db": 18.713107906319998,
+              "cosine": 0.9933282136917114,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 4.329430157667957e-05,
+              "snr_db": 18.713107906319998,
+              "cosine": 0.9933282136917114,
+              "max_abs_error": 0.0625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.0.mlp.experts.down_proj",
+        "selection": {
+          "expert": 15,
+          "rows": [
+            928,
+            992
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.00015938373690005392,
+              "snr_db": 11.768985518912217,
+              "cosine": 0.9673022627830505,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_source": {
+              "mse": 0.00015938373690005392,
+              "snr_db": 11.768985518912217,
+              "cosine": 0.9673022627830505,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999999403953552,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999999403953552,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 3.46642300428357e-05,
+              "snr_db": 18.39460998786219,
+              "cosine": 0.992854118347168,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 3.46642300428357e-05,
+              "snr_db": 18.39460998786219,
+              "cosine": 0.992854118347168,
+              "max_abs_error": 0.0625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999999403953552,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 3.46642300428357e-05,
+              "snr_db": 18.39460998786219,
+              "cosine": 0.992854118347168,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 3.46642300428357e-05,
+              "snr_db": 18.39460998786219,
+              "cosine": 0.992854118347168,
+              "max_abs_error": 0.0625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.0.mlp.experts.down_proj",
+        "selection": {
+          "expert": 31,
+          "rows": [
+            2560,
+            2624
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 5.090703416499309e-05,
+              "snr_db": 10.05691361607026,
+              "cosine": 0.9503889083862305,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_source": {
+              "mse": 5.090703416499309e-05,
+              "snr_db": 10.05691361607026,
+              "cosine": 0.9503889083862305,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 9.283082363253925e-06,
+              "snr_db": 17.447769537536104,
+              "cosine": 0.9910975694656372,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_row": {
+              "mse": 9.283082363253925e-06,
+              "snr_db": 17.447769537536104,
+              "cosine": 0.9910975694656372,
+              "max_abs_error": 0.03125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 9.283082363253925e-06,
+              "snr_db": 17.447769537536104,
+              "cosine": 0.9910975694656372,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_row": {
+              "mse": 9.283082363253925e-06,
+              "snr_db": 17.447769537536104,
+              "cosine": 0.9910975694656372,
+              "max_abs_error": 0.03125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.12.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 0,
+          "rows": [
+            320,
+            384
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 2.16591615753714e-05,
+              "snr_db": 14.586038312818703,
+              "cosine": 0.983059823513031,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_source": {
+              "mse": 2.16591615753714e-05,
+              "snr_db": 14.586038312818703,
+              "cosine": 0.983059823513031,
+              "max_abs_error": 0.0625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 4.34868934462429e-06,
+              "snr_db": 21.558870881147882,
+              "cosine": 0.9965336322784424,
+              "max_abs_error": 0.046875
+            },
+            "col_vs_row": {
+              "mse": 4.34868934462429e-06,
+              "snr_db": 21.558870881147882,
+              "cosine": 0.9965336322784424,
+              "max_abs_error": 0.046875
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 4.34868934462429e-06,
+              "snr_db": 21.558870881147882,
+              "cosine": 0.9965336322784424,
+              "max_abs_error": 0.046875
+            },
+            "col_vs_row": {
+              "mse": 4.34868934462429e-06,
+              "snr_db": 21.558870881147882,
+              "cosine": 0.9965336322784424,
+              "max_abs_error": 0.046875
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.12.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 15,
+          "rows": [
+            3744,
+            3808
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 4.6999507503642235e-06,
+              "snr_db": 19.136137672127195,
+              "cosine": 0.9940260648727417,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_source": {
+              "mse": 4.6999507503642235e-06,
+              "snr_db": 19.136137672127195,
+              "cosine": 0.9940260648727417,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 1.763485215633409e-06,
+              "snr_db": 23.393352512418847,
+              "cosine": 0.9977350234985352,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 1.763485215633409e-06,
+              "snr_db": 23.393352512418847,
+              "cosine": 0.9977350234985352,
+              "max_abs_error": 0.0078125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 1.763485215633409e-06,
+              "snr_db": 23.393352512418847,
+              "cosine": 0.9977350234985352,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 1.763485215633409e-06,
+              "snr_db": 23.393352512418847,
+              "cosine": 0.9977350234985352,
+              "max_abs_error": 0.0078125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.12.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 31,
+          "rows": [
+            2432,
+            2496
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 4.005401024187449e-06,
+              "snr_db": 19.421037042458778,
+              "cosine": 0.994435727596283,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_source": {
+              "mse": 4.005401024187449e-06,
+              "snr_db": 19.421037042458778,
+              "cosine": 0.994435727596283,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 1.2700032812063e-06,
+              "snr_db": 24.40944865769726,
+              "cosine": 0.9982061982154846,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 1.2700032812063e-06,
+              "snr_db": 24.40944865769726,
+              "cosine": 0.9982061982154846,
+              "max_abs_error": 0.0078125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 1.2700032812063e-06,
+              "snr_db": 24.40944865769726,
+              "cosine": 0.9982061982154846,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 1.2700032812063e-06,
+              "snr_db": 24.40944865769726,
+              "cosine": 0.9982061982154846,
+              "max_abs_error": 0.0078125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.12.mlp.experts.down_proj",
+        "selection": {
+          "expert": 0,
+          "rows": [
+            544,
+            608
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.017522361129522324,
+              "snr_db": 16.26093124932466,
+              "cosine": 0.9887127876281738,
+              "max_abs_error": 0.5
+            },
+            "col_vs_source": {
+              "mse": 0.017522361129522324,
+              "snr_db": 16.26093124932466,
+              "cosine": 0.9887127876281738,
+              "max_abs_error": 0.5
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0012665378162637353,
+              "snr_db": 27.67067590197891,
+              "cosine": 0.9991487860679626,
+              "max_abs_error": 0.5
+            },
+            "col_vs_row": {
+              "mse": 0.0012665378162637353,
+              "snr_db": 27.67067590197891,
+              "cosine": 0.9991487860679626,
+              "max_abs_error": 0.5
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0012665378162637353,
+              "snr_db": 27.67067590197891,
+              "cosine": 0.9991487860679626,
+              "max_abs_error": 0.5
+            },
+            "col_vs_row": {
+              "mse": 0.0012665378162637353,
+              "snr_db": 27.67067590197891,
+              "cosine": 0.9991487860679626,
+              "max_abs_error": 0.5
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.12.mlp.experts.down_proj",
+        "selection": {
+          "expert": 15,
+          "rows": [
+            1184,
+            1248
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.015192090533673763,
+              "snr_db": 17.306390044591193,
+              "cosine": 0.9910852313041687,
+              "max_abs_error": 0.5
+            },
+            "col_vs_source": {
+              "mse": 0.015192090533673763,
+              "snr_db": 17.306390044591193,
+              "cosine": 0.9910852313041687,
+              "max_abs_error": 0.5
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0012782786507159472,
+              "snr_db": 28.05631008698188,
+              "cosine": 0.9992207884788513,
+              "max_abs_error": 0.5
+            },
+            "col_vs_row": {
+              "mse": 0.0012782786507159472,
+              "snr_db": 28.05631008698188,
+              "cosine": 0.9992207884788513,
+              "max_abs_error": 0.5
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0012782786507159472,
+              "snr_db": 28.05631008698188,
+              "cosine": 0.9992207884788513,
+              "max_abs_error": 0.5
+            },
+            "col_vs_row": {
+              "mse": 0.0012782786507159472,
+              "snr_db": 28.05631008698188,
+              "cosine": 0.9992207884788513,
+              "max_abs_error": 0.5
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.12.mlp.experts.down_proj",
+        "selection": {
+          "expert": 31,
+          "rows": [
+            2816,
+            2880
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.004115412011742592,
+              "snr_db": 21.50794106725353,
+              "cosine": 0.9965274333953857,
+              "max_abs_error": 0.25
+            },
+            "col_vs_source": {
+              "mse": 0.004115412011742592,
+              "snr_db": 21.50794106725353,
+              "cosine": 0.9965274333953857,
+              "max_abs_error": 0.25
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0006623480003327131,
+              "snr_db": 29.441211980632257,
+              "cosine": 0.999433159828186,
+              "max_abs_error": 0.25
+            },
+            "col_vs_row": {
+              "mse": 0.0006623480003327131,
+              "snr_db": 29.441211980632257,
+              "cosine": 0.999433159828186,
+              "max_abs_error": 0.25
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0006623480003327131,
+              "snr_db": 29.441211980632257,
+              "cosine": 0.999433159828186,
+              "max_abs_error": 0.25
+            },
+            "col_vs_row": {
+              "mse": 0.0006623480003327131,
+              "snr_db": 29.441211980632257,
+              "cosine": 0.999433159828186,
+              "max_abs_error": 0.25
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.23.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 0,
+          "rows": [
+            1216,
+            1280
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 9.517974831396714e-06,
+              "snr_db": 15.509283632351561,
+              "cosine": 0.9863496422767639,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_source": {
+              "mse": 9.517974831396714e-06,
+              "snr_db": 15.509283632351561,
+              "cosine": 0.9863496422767639,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999999403953552,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 1.88177091331454e-06,
+              "snr_db": 22.54906163961005,
+              "cosine": 0.9972460865974426,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 1.88177091331454e-06,
+              "snr_db": 22.54906163961005,
+              "cosine": 0.9972460865974426,
+              "max_abs_error": 0.0078125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999999403953552,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 1.88177091331454e-06,
+              "snr_db": 22.54906163961005,
+              "cosine": 0.9972460865974426,
+              "max_abs_error": 0.0078125
+            },
+            "col_vs_row": {
+              "mse": 1.88177091331454e-06,
+              "snr_db": 22.54906163961005,
+              "cosine": 0.9972460865974426,
+              "max_abs_error": 0.0078125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.23.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 15,
+          "rows": [
+            4640,
+            4704
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 2.1276606275932863e-05,
+              "snr_db": 13.877398789559026,
+              "cosine": 0.9803929328918457,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_source": {
+              "mse": 2.1276606275932863e-05,
+              "snr_db": 13.877398789559026,
+              "cosine": 0.9803929328918457,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 3.7267313928168733e-06,
+              "snr_db": 21.44314144227006,
+              "cosine": 0.9964509010314941,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 3.7267313928168733e-06,
+              "snr_db": 21.44314144227006,
+              "cosine": 0.9964509010314941,
+              "max_abs_error": 0.015625
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0000001192092896,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 3.7267313928168733e-06,
+              "snr_db": 21.44314144227006,
+              "cosine": 0.9964509010314941,
+              "max_abs_error": 0.015625
+            },
+            "col_vs_row": {
+              "mse": 3.7267313928168733e-06,
+              "snr_db": 21.44314144227006,
+              "cosine": 0.9964509010314941,
+              "max_abs_error": 0.015625
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.23.mlp.experts.gate_up_proj",
+        "selection": {
+          "expert": 31,
+          "rows": [
+            3328,
+            3392
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 3.990407276432961e-05,
+              "snr_db": 12.64517074522194,
+              "cosine": 0.9738556146621704,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_source": {
+              "mse": 3.990407276432961e-05,
+              "snr_db": 12.64517074522194,
+              "cosine": 0.9738556146621704,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 7.861207450332586e-06,
+              "snr_db": 19.700450411738704,
+              "cosine": 0.9946944117546082,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_row": {
+              "mse": 7.861207450332586e-06,
+              "snr_db": 19.700450411738704,
+              "cosine": 0.9946944117546082,
+              "max_abs_error": 0.03125
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 7.861207450332586e-06,
+              "snr_db": 19.700450411738704,
+              "cosine": 0.9946944117546082,
+              "max_abs_error": 0.03125
+            },
+            "col_vs_row": {
+              "mse": 7.861207450332586e-06,
+              "snr_db": 19.700450411738704,
+              "cosine": 0.9946944117546082,
+              "max_abs_error": 0.03125
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.23.mlp.experts.down_proj",
+        "selection": {
+          "expert": 0,
+          "rows": [
+            1728,
+            1792
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.3345228433609009,
+              "snr_db": 18.91138322342702,
+              "cosine": 0.993723452091217,
+              "max_abs_error": 2.0
+            },
+            "col_vs_source": {
+              "mse": 0.3345228433609009,
+              "snr_db": 18.91138322342702,
+              "cosine": 0.993723452091217,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.03694525733590126,
+              "snr_db": 28.480054059565276,
+              "cosine": 0.9992936849594116,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.03694525733590126,
+              "snr_db": 28.480054059565276,
+              "cosine": 0.9992936849594116,
+              "max_abs_error": 2.0
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.03694525733590126,
+              "snr_db": 28.480054059565276,
+              "cosine": 0.9992936849594116,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.03694525733590126,
+              "snr_db": 28.480054059565276,
+              "cosine": 0.9992936849594116,
+              "max_abs_error": 2.0
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.23.mlp.experts.down_proj",
+        "selection": {
+          "expert": 15,
+          "rows": [
+            2368,
+            2432
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.4296101927757263,
+              "snr_db": 18.094980773315523,
+              "cosine": 0.9924322962760925,
+              "max_abs_error": 2.0
+            },
+            "col_vs_source": {
+              "mse": 0.4296101927757263,
+              "snr_db": 18.094980773315523,
+              "cosine": 0.9924322962760925,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 0.9999998807907104,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0367228202521801,
+              "snr_db": 28.77636627147035,
+              "cosine": 0.9993399977684021,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.0367228202521801,
+              "snr_db": 28.77636627147035,
+              "cosine": 0.9993399977684021,
+              "max_abs_error": 2.0
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.0367228202521801,
+              "snr_db": 28.77636627147035,
+              "cosine": 0.9993399977684021,
+              "max_abs_error": 2.0
+            },
+            "col_vs_row": {
+              "mse": 0.0367228202521801,
+              "snr_db": 28.77636627147035,
+              "cosine": 0.9993399977684021,
+              "max_abs_error": 2.0
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      },
+      {
+        "kind": "moe_decoded_mxfp4",
+        "tensor": "model.layers.23.mlp.experts.down_proj",
+        "selection": {
+          "expert": 31,
+          "rows": [
+            1152,
+            1216
+          ],
+          "columns": [
+            0,
+            2880
+          ]
+        },
+        "shape": [
+          64,
+          2880
+        ],
+        "modes": {
+          "2d_direct": {
+            "row_vs_source": {
+              "mse": 0.8157240152359009,
+              "snr_db": 15.382010775317275,
+              "cosine": 0.9859480857849121,
+              "max_abs_error": 4.0
+            },
+            "col_vs_source": {
+              "mse": 0.8157240152359009,
+              "snr_db": 15.382010775317275,
+              "cosine": 0.9859480857849121,
+              "max_abs_error": 4.0
+            },
+            "col_vs_row": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            }
+          },
+          "1d_direct": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.06069200485944748,
+              "snr_db": 26.666128419041087,
+              "cosine": 0.9989300966262817,
+              "max_abs_error": 4.0
+            },
+            "col_vs_row": {
+              "mse": 0.06069200485944748,
+              "snr_db": 26.666128419041087,
+              "cosine": 0.9989300966262817,
+              "max_abs_error": 4.0
+            }
+          },
+          "1d_qdq": {
+            "row_vs_source": {
+              "mse": 0.0,
+              "snr_db": "Infinity",
+              "cosine": 1.0,
+              "max_abs_error": 0.0
+            },
+            "col_vs_source": {
+              "mse": 0.06069200485944748,
+              "snr_db": 26.666128419041087,
+              "cosine": 0.9989300966262817,
+              "max_abs_error": 4.0
+            },
+            "col_vs_row": {
+              "mse": 0.06069200485944748,
+              "snr_db": 26.666128419041087,
+              "cosine": 0.9989300966262817,
+              "max_abs_error": 4.0
+            }
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0
+      }
+    ]
+  }
+}

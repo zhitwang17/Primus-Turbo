@@ -1,0 +1,371 @@
+{
+  "environment": {
+    "timestamp_unix": 1787752311.8543699,
+    "repo": "/home/zhitwang/primus-turbo-branches/mxfp4-1d-scale-gpu-validation",
+    "extension": "/home/zhitwang/primus-turbo/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so",
+    "torch": "2.8.0+rocm7.2.2.git7f079cbb",
+    "rocm": "7.2.53211-671d39a71e",
+    "device": "",
+    "device_total_memory": 309220868096
+  },
+  "requested_phase": "primitive",
+  "primitive": {
+    "cases": [
+      {
+        "shape": [
+          64,
+          128
+        ],
+        "seed": 11,
+        "modes": {
+          "2d_direct": {
+            "gpu_shapes": {
+              "row_q": [
+                64,
+                64
+              ],
+              "row_scale": [
+                64,
+                4
+              ],
+              "col_q": [
+                128,
+                64
+              ],
+              "col_scale": [
+                128,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              2,
+              4
+            ],
+            "col_scale_shape_cpu": [
+              4,
+              2
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          },
+          "1d_direct": {
+            "gpu_shapes": {
+              "row_q": [
+                64,
+                64
+              ],
+              "row_scale": [
+                64,
+                4
+              ],
+              "col_q": [
+                128,
+                64
+              ],
+              "col_scale": [
+                128,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              64,
+              4
+            ],
+            "col_scale_shape_cpu": [
+              128,
+              2
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          },
+          "1d_qdq": {
+            "gpu_shapes": {
+              "row_q": [
+                64,
+                64
+              ],
+              "row_scale": [
+                64,
+                4
+              ],
+              "col_q": [
+                128,
+                64
+              ],
+              "col_scale": [
+                128,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              64,
+              4
+            ],
+            "col_scale_shape_cpu": [
+              128,
+              2
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.025634765625
+      },
+      {
+        "shape": [
+          96,
+          160
+        ],
+        "seed": 17,
+        "modes": {
+          "2d_direct": {
+            "gpu_shapes": {
+              "row_q": [
+                96,
+                128
+              ],
+              "row_scale": [
+                96,
+                8
+              ],
+              "col_q": [
+                160,
+                64
+              ],
+              "col_scale": [
+                160,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              3,
+              5
+            ],
+            "col_scale_shape_cpu": [
+              5,
+              3
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          },
+          "1d_direct": {
+            "gpu_shapes": {
+              "row_q": [
+                96,
+                128
+              ],
+              "row_scale": [
+                96,
+                8
+              ],
+              "col_q": [
+                160,
+                64
+              ],
+              "col_scale": [
+                160,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              96,
+              5
+            ],
+            "col_scale_shape_cpu": [
+              160,
+              3
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          },
+          "1d_qdq": {
+            "gpu_shapes": {
+              "row_q": [
+                96,
+                128
+              ],
+              "row_scale": [
+                96,
+                8
+              ],
+              "col_q": [
+                160,
+                64
+              ],
+              "col_scale": [
+                160,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              96,
+              5
+            ],
+            "col_scale_shape_cpu": [
+              160,
+              3
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.02819010615348816
+      },
+      {
+        "shape": [
+          3,
+          64,
+          128
+        ],
+        "seed": 23,
+        "modes": {
+          "2d_direct": {
+            "gpu_shapes": {
+              "row_q": [
+                3,
+                64,
+                64
+              ],
+              "row_scale": [
+                3,
+                64,
+                4
+              ],
+              "col_q": [
+                3,
+                128,
+                64
+              ],
+              "col_scale": [
+                3,
+                128,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              3,
+              2,
+              4
+            ],
+            "col_scale_shape_cpu": [
+              3,
+              4,
+              2
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          },
+          "1d_direct": {
+            "gpu_shapes": {
+              "row_q": [
+                3,
+                64,
+                64
+              ],
+              "row_scale": [
+                3,
+                64,
+                4
+              ],
+              "col_q": [
+                3,
+                128,
+                64
+              ],
+              "col_scale": [
+                3,
+                128,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              3,
+              64,
+              4
+            ],
+            "col_scale_shape_cpu": [
+              3,
+              128,
+              2
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          },
+          "1d_qdq": {
+            "gpu_shapes": {
+              "row_q": [
+                3,
+                64,
+                64
+              ],
+              "row_scale": [
+                3,
+                64,
+                4
+              ],
+              "col_q": [
+                3,
+                128,
+                64
+              ],
+              "col_scale": [
+                3,
+                128,
+                4
+              ]
+            },
+            "row_codes_equal_cpu": true,
+            "col_codes_equal_cpu": true,
+            "row_dequant_equal_cpu_bf16": true,
+            "col_dequant_equal_cpu_bf16": true,
+            "row_scale_shape_cpu": [
+              3,
+              64,
+              4
+            ],
+            "col_scale_shape_cpu": [
+              3,
+              128,
+              2
+            ],
+            "row_scales_equal_cpu": true,
+            "col_scales_equal_cpu": true
+          }
+        },
+        "1d_direct_vs_qdq_col_code_difference_fraction": 0.0274658203125
+      }
+    ]
+  }
+}
