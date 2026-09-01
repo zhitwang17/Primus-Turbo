@@ -26,6 +26,94 @@ from primus_turbo.pytorch.ops.quantization import (
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
 
+_MXFP4_SCALE_ROUNDING_ENV = "PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"
+
+
+def _load_mxfp4_flydsl_kernel():
+    """Import the private FlyDSL module lazily so non-FlyDSL GPUs can collect this file."""
+    pytest.importorskip("flydsl")
+    from primus_turbo.flydsl.quantization import mxfp4_quant_kernel
+
+    return mxfp4_quant_kernel
+
+
+def _require_gfx950_mxfp4_flydsl():
+    """Return the FlyDSL kernel module only where the public path can select it."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if (props.major, props.minor) != (9, 5):
+        pytest.skip("FlyDSL MXFP4 quantization requires gfx950")
+
+    # On gfx950 FlyDSL is part of the supported path, so an internal import error
+    # must fail the test instead of being hidden as an unavailable-backend skip.
+    from primus_turbo.flydsl.quantization import mxfp4_quant_kernel
+
+    return mxfp4_quant_kernel
+
+
+def _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe):
+    """Call the HIP oracle directly, bypassing Python backend dispatch."""
+    return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
+        x,
+        turbo.float4_e2m1fn_x2,
+        128,
+        row_recipe.use_2d_block,
+        row_recipe.use_sr,
+        row_recipe.use_rht,
+        col_recipe.use_2d_block,
+        col_recipe.use_sr,
+        col_recipe.use_rht,
+        False,
+        False,
+        False,
+        False,
+    )
+
+
+def _assert_byte_exact(actual, expected):
+    assert len(actual) == len(expected)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_tensor.view(torch.uint8),
+            expected_tensor.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        (None, 1 << 21),
+        ("", 1 << 21),
+        ("0", 1 << 21),
+        ("1", 1 << 22),
+        ("2", 3 << 19),
+    ],
+)
+def test_mxfp4_scale_rounding_bias(monkeypatch, mode, expected):
+    if mode is None:
+        monkeypatch.delenv(_MXFP4_SCALE_ROUNDING_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+
+    kernel = _load_mxfp4_flydsl_kernel()
+    assert kernel._mxfp4_scale_rounding_bias() == expected
+
+
+@pytest.mark.parametrize("mode", ["invalid", " ", "00", "-1", "3"])
+def test_mxfp4_scale_rounding_bias_rejects_invalid_mode(monkeypatch, mode):
+    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+    kernel = _load_mxfp4_flydsl_kernel()
+    with pytest.raises(RuntimeError, match="must be 0, 1, or 2"):
+        kernel._mxfp4_scale_rounding_bias()
+
 
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize(
@@ -701,6 +789,275 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         scaling_recipe=scaling_recipe,
     )
     torch.testing.assert_close(colwise_ref, out_colwise, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize(
+    "mode,shape,row_2d,col_2d,row_rht,col_rht",
+    [
+        (mode, shape, row_2d, col_2d, row_rht, col_rht)
+        for mode in ("0", "1", "2")
+        for shape, row_2d, col_2d, row_rht, col_rht in (
+            ((384, 256), False, False, False, True),
+            ((384, 256), True, True, False, False),
+        )
+    ]
+    + [(mode, (2, 192, 64), True, True, False, False) for mode in ("0", "1", "2")],
+    ids=[
+        "mode0-dense-1d-rht",
+        "mode0-dense-2d",
+        "mode1-dense-1d-rht",
+        "mode1-dense-2d",
+        "mode2-dense-1d-rht",
+        "mode2-dense-2d",
+        "mode0-batched-3d-padded",
+        "mode1-batched-3d-padded",
+        "mode2-batched-3d-padded",
+    ],
+)
+def test_mxfp4_scale_rounding_flydsl_matches_hip(
+    monkeypatch,
+    mode,
+    shape,
+    row_2d,
+    col_2d,
+    row_rht,
+    col_rht,
+):
+    """Every UoS mode is byte-exact across explicit FlyDSL and HIP entry points."""
+    kernel = _require_gfx950_mxfp4_flydsl()
+    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+
+    torch.manual_seed(42)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    row_recipe = ScalingRecipe(use_2d_block=row_2d, use_rht=row_rht)
+    col_recipe = ScalingRecipe(use_2d_block=col_2d, use_rht=col_rht)
+
+    if x.ndim == 2:
+        assert kernel.dual_eligible(x.shape[0], x.shape[1], row_recipe, col_recipe)
+        fly = kernel.flydsl_dual_quant(
+            x,
+            turbo.float4_e2m1fn_x2,
+            row_rht,
+            col_rht,
+            row_2d=row_2d,
+            col_2d=col_2d,
+        )
+    else:
+        assert kernel.dual3_eligible(x.shape[1], x.shape[2], row_recipe, col_recipe)
+        fly = kernel.flydsl_dual_quant_batched(
+            x,
+            turbo.float4_e2m1fn_x2,
+            row_rht,
+            col_rht,
+            row_2d=row_2d,
+            col_2d=col_2d,
+        )
+
+    hip = _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe)
+    _assert_byte_exact(fly, hip)
+
+
+def test_mxfp4_scale_rounding_runtime_mode_switch(monkeypatch):
+    """A compiled FlyDSL kernel consumes each mode at launch instead of baking it in."""
+    kernel = _require_gfx950_mxfp4_flydsl()
+    recipe = ScalingRecipe()
+    assert kernel.dual_eligible(384, 256, recipe, recipe)
+
+    # Exact bf16 thresholds make mode 1 differ at 1.5 and mode 2 differ at 1.75.
+    block_values = torch.tensor([1.5, 1.75] * 4, device="cuda", dtype=torch.bfloat16)
+    x = block_values.repeat_interleave(MXFP4_BLOCK_SIZE).expand(384, -1).contiguous()
+
+    flydsl_calls = []
+    original_flydsl_dual_quant = kernel.flydsl_dual_quant
+
+    def traced_flydsl_dual_quant(*args, **kwargs):
+        flydsl_calls.append(True)
+        return original_flydsl_dual_quant(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "flydsl_dual_quant", traced_flydsl_dual_quant)
+
+    results = {}
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+        fly = quantize_fp4_with_trans(
+            x,
+            turbo.float4_e2m1fn_x2,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP4_BLOCK_SIZE,
+            scaling_recipe=recipe,
+            scaling_recipe_for_trans=recipe,
+        )
+        hip = _hip_quantize_mxfp4_dual(x, recipe, recipe)
+        _assert_byte_exact(fly, hip)
+        results[mode] = tuple(tensor.clone() for tensor in fly)
+
+    assert len(flydsl_calls) == 3, "the public wrapper must dispatch every call to FlyDSL"
+    assert not torch.equal(results["0"][1].view(torch.uint8), results["1"][1].view(torch.uint8))
+    assert not torch.equal(results["0"][1].view(torch.uint8), results["2"][1].view(torch.uint8))
+
+
+def test_mxfp4_scale_rounding_hip_rejects_invalid_mode(monkeypatch):
+    """The HIP entry point uses the same strict runtime-mode parser as FlyDSL."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, "00")
+    x = torch.zeros((32, 32), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="must be 0, 1, or 2"):
+        quantize_fp4(
+            x,
+            turbo.float4_e2m1fn_x2,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            axis=1,
+            block_size=MXFP4_BLOCK_SIZE,
+            scaling_recipe=ScalingRecipe(),
+        )
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "2"])
+@pytest.mark.parametrize("use_rht", [False, True], ids=["plain", "rht"])
+def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch, mode, use_rht):
+    """Irregular and empty K=256 groups preserve HIP bytes under every UoS mode."""
+    _require_gfx950_mxfp4_flydsl()
+    from primus_turbo.flydsl.quantization import mxfp4_grouped_quant
+
+    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+    group_lens_values = (0, 1, 255, 257, 511, 513)
+    group_lens = torch.tensor(group_lens_values, device="cuda", dtype=torch.int64)
+    group_offs = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int64), group_lens.cumsum(0)])
+
+    torch.manual_seed(42)
+    x = torch.randn((sum(group_lens_values), 256), device="cuda", dtype=torch.bfloat16)
+
+    # Calling the raw function makes the tested backend unambiguous. Its colwise
+    # layout is 256-aligned per group, while the HIP oracle is 128-aligned.
+    fly = mxfp4_grouped_quant.grouped_quant_mxfp4_raw(
+        x,
+        group_lens,
+        group_offs,
+        turbo.float4_e2m1fn_x2,
+        use_rht,
+        use_rht,
+    )
+    hip = torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
+        x,
+        group_lens,
+        group_offs,
+        turbo.float4_e2m1fn_x2,
+        False,
+        False,
+        use_rht,
+        False,
+        False,
+        use_rht,
+    )
+
+    _assert_byte_exact(fly[:2], hip[:2])
+    torch.testing.assert_close(hip[4], group_lens, rtol=0, atol=0)
+    torch.testing.assert_close(hip[5], group_offs, rtol=0, atol=0)
+
+    def padded_layout(alignment):
+        lengths = [((length + alignment - 1) // alignment) * alignment for length in group_lens_values]
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        return lengths, offsets
+
+    fly_lens, fly_offs = padded_layout(256)
+    hip_lens, hip_offs = padded_layout(128)
+    torch.testing.assert_close(
+        fly[4], torch.tensor(fly_lens, device="cuda", dtype=torch.int64), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        fly[5], torch.tensor(fly_offs, device="cuda", dtype=torch.int64), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        hip[6], torch.tensor(hip_lens, device="cuda", dtype=torch.int64), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        hip[7], torch.tensor(hip_offs, device="cuda", dtype=torch.int64), rtol=0, atol=0
+    )
+
+    fly_col, fly_scale = fly[2].view(torch.uint8), fly[3].view(torch.uint8)
+    hip_col, hip_scale = hip[2].view(torch.uint8), hip[3].view(torch.uint8)
+    for fly_start, fly_length, hip_start, hip_length in zip(fly_offs, fly_lens, hip_offs, hip_lens):
+        torch.testing.assert_close(
+            fly_col[:, fly_start // 2 : (fly_start + hip_length) // 2],
+            hip_col[:, hip_start // 2 : (hip_start + hip_length) // 2],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            fly_scale[:, fly_start // MXFP4_BLOCK_SIZE : (fly_start + hip_length) // MXFP4_BLOCK_SIZE],
+            hip_scale[:, hip_start // MXFP4_BLOCK_SIZE : (hip_start + hip_length) // MXFP4_BLOCK_SIZE],
+            rtol=0,
+            atol=0,
+        )
+        assert (
+            torch.count_nonzero(
+                fly_col[:, (fly_start + hip_length) // 2 : (fly_start + fly_length) // 2]
+            ).item()
+            == 0
+        )
+        assert (
+            torch.count_nonzero(
+                fly_scale[
+                    :,
+                    (fly_start + hip_length) // MXFP4_BLOCK_SIZE : (fly_start + fly_length)
+                    // MXFP4_BLOCK_SIZE,
+                ]
+            ).item()
+            == 0
+        )
+
+
+def test_mxfp4_scale_rounding_sr_scale_parity(monkeypatch):
+    """SR changes samples but leaves FlyDSL and HIP scale selection byte-exact."""
+    kernel = _require_gfx950_mxfp4_flydsl()
+    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, "2")
+
+    torch.manual_seed(123)
+    x = torch.randn((384, 256), device="cuda", dtype=torch.bfloat16)
+    row_recipe = ScalingRecipe(use_sr=True)
+    col_recipe = ScalingRecipe(use_sr=True, use_rht=True)
+    assert kernel.dual_eligible(x.shape[0], x.shape[1], row_recipe, col_recipe)
+
+    fly1 = kernel.flydsl_dual_quant(
+        x,
+        turbo.float4_e2m1fn_x2,
+        row_recipe.use_rht,
+        col_recipe.use_rht,
+        row_sr=True,
+        col_sr=True,
+    )
+    fly2 = kernel.flydsl_dual_quant(
+        x,
+        turbo.float4_e2m1fn_x2,
+        row_recipe.use_rht,
+        col_recipe.use_rht,
+        row_sr=True,
+        col_sr=True,
+    )
+    hip = _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe)
+
+    assert not torch.equal(fly1[0].view(torch.uint8), fly2[0].view(torch.uint8))
+    assert not torch.equal(fly1[2].view(torch.uint8), fly2[2].view(torch.uint8))
+    for scale_index in (1, 3):
+        torch.testing.assert_close(
+            fly1[scale_index].view(torch.uint8),
+            hip[scale_index].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            fly2[scale_index].view(torch.uint8),
+            hip[scale_index].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
