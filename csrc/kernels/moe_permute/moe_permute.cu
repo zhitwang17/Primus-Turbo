@@ -697,31 +697,37 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
             permuted_tokens_int4, tokens_int4, permuted_probs, probs, row_id_map,                  \
             num_dispatched_tokens_ptr, num_local_experts, hidden_int4, effective_probs_stride)
 
+    // Combine is bandwidth-bound and latency-sensitive. Use a smaller block for the default
+    // H=2880 path so small routes launch enough resident blocks to utilize more CUs, while the
+    // large-hidden path keeps its existing chunking.
+#define UNPERMUTE_COMBINE_BLOCK(num_hidden_per_block)                                               \
+    (((num_hidden_per_block) == 256) ? 128 : (num_hidden_per_block))
 #define LAUNCH_UNPERMUTE(num_hidden_per_block)                                                     \
     do {                                                                                           \
-        const int num_chunks =                                                                     \
-            (hidden_int4 + (num_hidden_per_block) - 1) / (num_hidden_per_block);                   \
+        constexpr int kCB    = UNPERMUTE_COMBINE_BLOCK(num_hidden_per_block);                       \
+        const int num_chunks = (hidden_int4 + (kCB) - 1) / (kCB);                                   \
         if (num_chunks == 1) {                                                                     \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max), 1u);                          \
-            LAUNCH_UNPERMUTE_NC(num_hidden_per_block, 1, grid);                                    \
+            LAUNCH_UNPERMUTE_NC(kCB, 1, grid);                                                     \
         } else if (num_chunks == 2) {                                                              \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max) * 2u);                         \
-            LAUNCH_UNPERMUTE_NC(num_hidden_per_block, 2, grid);                                    \
+            LAUNCH_UNPERMUTE_NC(kCB, 2, grid);                                                     \
         } else if (num_chunks == 3) {                                                              \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max) * 3u);                         \
-            LAUNCH_UNPERMUTE_NC(num_hidden_per_block, 3, grid);                                    \
+            LAUNCH_UNPERMUTE_NC(kCB, 3, grid);                                                     \
         } else if (num_chunks == 4) {                                                              \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max) * 4u);                         \
-            LAUNCH_UNPERMUTE_NC(num_hidden_per_block, 4, grid);                                    \
+            LAUNCH_UNPERMUTE_NC(kCB, 4, grid);                                                     \
         } else {                                                                                   \
             dim3 grid(static_cast<unsigned int>(num_dispatched_max),                               \
                       static_cast<unsigned int>(num_chunks));                                      \
-            LAUNCH_UNPERMUTE_NC(num_hidden_per_block, 0, grid);                                    \
+            LAUNCH_UNPERMUTE_NC(kCB, 0, grid);                                                     \
         }                                                                                          \
     } while (0)
 
-        DISPATCH_PERMUTE_UNPERMUTE(hidden_size, LAUNCH_UNPERMUTE);
+    DISPATCH_PERMUTE_UNPERMUTE(hidden_size, LAUNCH_UNPERMUTE);
 #undef LAUNCH_UNPERMUTE
+#undef UNPERMUTE_COMBINE_BLOCK
 #undef LAUNCH_UNPERMUTE_NC
     }
 
