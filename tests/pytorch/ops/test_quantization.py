@@ -840,6 +840,27 @@ def test_mxfp4_scale_rounding_dense_special_recipes_match_hip(monkeypatch):
         _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe))
 
 
+def test_mxfp4_dense_dual_covers_every_eligible_row(monkeypatch):
+    """A dense launch must not leave tail rows unwritten for an eligible shape."""
+    kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)
+    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, "2")
+    torch.manual_seed(42)
+    x = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
+    row_recipe = ScalingRecipe()
+    col_recipe = ScalingRecipe(use_rht=True)
+
+    assert kernel.dual_eligible(x.shape[0], x.shape[1], row_recipe, col_recipe)
+    assert x.shape[0] % kernel._TR == 0
+
+    fly = kernel.flydsl_dual_quant(
+        x,
+        turbo.float4_e2m1fn_x2,
+        row_recipe.use_rht,
+        col_recipe.use_rht,
+    )
+    _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe))
+
+
 def test_mxfp4_scale_rounding_batched_3d_padding_and_cache(monkeypatch):
     """Padded 3D quant caches distinct compiled variants for modes 0 and 2."""
     kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)

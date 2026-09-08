@@ -25,6 +25,39 @@ from tests.pytorch.test_utils import compute_snr
 torch.manual_seed(42)
 
 
+def test_gemm_fp4_dense_quant_tail_regression(monkeypatch):
+    """Eligible dense shapes must not feed unwritten FlyDSL quant rows to GEMM."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", "2")
+    torch.manual_seed(20260908)
+    a = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
+    reference = a @ b.T
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+        use_preshuffle=False,
+    )
+
+    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
+    GlobalBackendManager.set_auto_tune(False)
+    try:
+        actual = gemm_fp4(a, b, trans_a=False, trans_b=True, out_dtype=torch.bfloat16, config=config)
+        torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.reset()
+
+    assert torch.isfinite(actual).all()
+    assert compute_snr(reference, actual) > 10
+
+
 @pytest.mark.parametrize("m", [256, 512, 1024])
 @pytest.mark.parametrize("n", [256, 352, 1024, 2048])
 @pytest.mark.parametrize("k", [128, 160, 512, 1024])
