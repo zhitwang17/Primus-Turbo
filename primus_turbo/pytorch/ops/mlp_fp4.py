@@ -20,6 +20,7 @@ Do not route this through the G=1 grouped GEMM: that path is graph-correct and a
 TTT loss on Llama-3.1-8B.
 """
 
+from dataclasses import replace
 from typing import Optional, Union
 
 import torch
@@ -146,7 +147,7 @@ class FP4MLPMXFunc(torch.autograd.Function):
 
         # x's col-wise half is a wgrad operand, so it is the one that carries the RHT.
         x_scaling_recipe = ScalingRecipe()
-        x_t_scaling_recipe = ScalingRecipe(use_rht=True)
+        x_t_scaling_recipe = ScalingRecipe(use_rht=True, rht_seed=config.rht_seed)
         if not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale = quantize_fp4_with_trans(
                 x,
@@ -195,6 +196,7 @@ class FP4MLPMXFunc(torch.autograd.Function):
             False,
             False,
             config.scale_rounding_mode,
+            config.rht_mask,
             activation,
             clamp_limit,
         )
@@ -225,7 +227,9 @@ class FP4MLPMXFunc(torch.autograd.Function):
             probs,
         )
         ctx.out_dtype = out_dtype
-        ctx.config = config
+        # The config is mutable.  Snapshot it so changing a reused campaign
+        # config between forward and backward cannot mismatch the paired RHT.
+        ctx.config = replace(config)
         ctx.activation = activation
         ctx.clamp_limit = clamp_limit
         ctx.fuse_w1_accum = fuse_w1_accum
@@ -259,7 +263,7 @@ class FP4MLPMXFunc(torch.autograd.Function):
             ctx.config.granularity,
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(use_sr=sr),
-            scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True),
+            scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True, rht_seed=ctx.config.rht_seed),
             scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
         grad_w2 = _bgrad_gemm_fp4_impl_wrapper(
@@ -291,6 +295,7 @@ class FP4MLPMXFunc(torch.autograd.Function):
             sr,
             sr,
             ctx.config.scale_rounding_mode,
+            ctx.config.rht_mask,
             ctx.activation,
             ctx.clamp_limit,
         )

@@ -70,6 +70,8 @@ def _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe, scale_rounding_mode=0):
         False,
         False,
         scale_rounding_mode,
+        row_recipe.rht_mask,
+        col_recipe.rht_mask,
     )
 
 
@@ -82,6 +84,19 @@ def _assert_byte_exact(actual, expected):
             rtol=0,
             atol=0,
         )
+
+
+def _apply_static_rht_signs(x, mask, axis):
+    """Reference ``D(mask)`` for the repeated block32 randomized-RHT contract."""
+    extent = x.shape[axis]
+    signs = torch.tensor(
+        [-1.0 if (mask >> (i % MXFP4_BLOCK_SIZE)) & 1 else 1.0 for i in range(extent)],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    shape = [1] * x.ndim
+    shape[axis] = extent
+    return (x * signs.reshape(shape)).contiguous()
 
 
 def test_mxfp4_scale_rounding_mode_contract():
@@ -860,6 +875,47 @@ def test_mxfp4_scale_rounding_dense_special_recipes_match_hip():
         _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe, mode))
 
 
+@pytest.mark.parametrize("randomized_axis", ("row", "col"))
+def test_mxfp4_randomized_rht_matches_hip_and_presign_oracle(randomized_axis):
+    """The public FlyDSL path and HIP apply the same D(mask) before fixed H16x2."""
+    kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)
+    torch.manual_seed(2026)
+    x = torch.randn((384, 256), device="cuda", dtype=torch.bfloat16)
+
+    random_recipe = ScalingRecipe(use_rht=True, rht_seed=42)
+    plain_recipe = ScalingRecipe()
+    row_recipe = random_recipe if randomized_axis == "row" else plain_recipe
+    col_recipe = random_recipe if randomized_axis == "col" else plain_recipe
+    assert kernel.dual_eligible(x.shape[0], x.shape[1], row_recipe, col_recipe)
+
+    randomized = quantize_fp4_with_trans(
+        x,
+        turbo.float4_e2m1fn_x2,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP4_BLOCK_SIZE,
+        scaling_recipe=row_recipe,
+        scaling_recipe_for_trans=col_recipe,
+    )
+    _assert_byte_exact(randomized, _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe))
+
+    # A randomized RHT on x must be byte-identical to the legacy fixed H16x2
+    # applied to a tensor whose contraction axis was pre-signed by D(mask).
+    axis = 1 if randomized_axis == "row" else 0
+    signed_x = _apply_static_rht_signs(x, random_recipe.rht_mask, axis)
+    fixed_rht = ScalingRecipe(use_rht=True)
+    fixed_row = fixed_rht if randomized_axis == "row" else plain_recipe
+    fixed_col = fixed_rht if randomized_axis == "col" else plain_recipe
+    oracle = _hip_quantize_mxfp4_dual(signed_x, fixed_row, fixed_col)
+    indices = (0, 1) if randomized_axis == "row" else (2, 3)
+    _assert_byte_exact(tuple(randomized[i] for i in indices), tuple(oracle[i] for i in indices))
+
+    other_recipe = ScalingRecipe(use_rht=True, rht_seed=1)
+    other_row = other_recipe if randomized_axis == "row" else plain_recipe
+    other_col = other_recipe if randomized_axis == "col" else plain_recipe
+    other = _hip_quantize_mxfp4_dual(x, other_row, other_col)
+    assert not torch.equal(randomized[indices[0]].view(torch.uint8), other[indices[0]].view(torch.uint8))
+
+
 def test_mxfp4_scale_rounding_batched_3d_padding_and_cache():
     """Padded 3D quant caches distinct compiled variants for modes 0 and 2."""
     kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)
@@ -932,7 +988,8 @@ def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip():
     expected_hip_lens = torch.tensor(hip_lens, device="cuda", dtype=torch.int64)
     expected_hip_offs = torch.tensor(hip_offs, device="cuda", dtype=torch.int64)
 
-    for use_rht in (False, True):
+    for use_rht, rht_seed in ((False, 0), (True, 0), (True, 42)):
+        rht_mask = ScalingRecipe(use_rht=use_rht, rht_seed=rht_seed).rht_mask
         # The FlyDSL colwise layout is 256-aligned per group; HIP uses 128 alignment.
         fly = mxfp4_grouped_quant.grouped_quant_mxfp4_raw(
             x,
@@ -942,6 +999,8 @@ def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip():
             use_rht,
             use_rht,
             scale_rounding_mode=scale_rounding_mode,
+            row_rht_mask=rht_mask,
+            col_rht_mask=rht_mask,
         )
         hip = torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
             x,
@@ -955,6 +1014,8 @@ def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip():
             False,
             use_rht,
             scale_rounding_mode,
+            rht_mask,
+            rht_mask,
         )
 
         _assert_byte_exact(fly[:2], hip[:2])

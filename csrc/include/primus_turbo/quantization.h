@@ -101,6 +101,11 @@ struct ScalingRecipe {
 
     bool shuffle_scale = false;
     bool shuffle_out   = false;
+
+    // Static Rademacher signs applied immediately before the fixed H16 x 2
+    // transform. Bit q controls logical element q within each 32-value block.
+    // A zero mask preserves the historical fixed-Hadamard behavior exactly.
+    uint32_t rht_mask = 0;
 };
 
 constexpr int FP32_MANTISSA_BITS     = 23;

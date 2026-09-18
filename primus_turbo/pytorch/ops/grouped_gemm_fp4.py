@@ -17,6 +17,7 @@ share it**, so the recipes are paired exactly like the dense ``gemm_fp4``:
     wgrad : dB   = gradO_col(rht=T)     @ A_col(rht=T)^T          (contract M_g)
 """
 
+from dataclasses import replace
 from typing import Optional, Union
 
 import torch
@@ -139,6 +140,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         a_scaling_recipe = ScalingRecipe()
         a_t_scaling_recipe = ScalingRecipe(
             use_rht=True,
+            rht_seed=config.rht_seed,
         )
         if not isinstance(a, QuantizedTensor):
             a_row, a_row_scale, a_col, a_col_scale, _, group_offs_padded_rowwise, _, _ = (
@@ -231,7 +233,9 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
 
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale, group_lens, group_offs)
         ctx.total_m = total_m
-        ctx.config = config
+        # The config is mutable.  Snapshot it so changing a reused campaign
+        # config between forward and backward cannot mismatch the paired RHT.
+        ctx.config = replace(config)
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
@@ -250,6 +254,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         grad_out_t_scaling_recipe = ScalingRecipe(
             use_sr=ctx.config.use_gradient_sr,
             use_rht=True,
+            rht_seed=ctx.config.rht_seed,
         )
         (
             grad_out_fp4_row,

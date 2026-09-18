@@ -42,6 +42,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _microblock_vf,
     _mxfp4_scale_rounding_bias,
     _next_sr_seed,
+    _normalize_rht_mask,
     _sr_hash,
     vf_exp_up,
 )
@@ -108,6 +109,8 @@ def compile_grouped_mxfp4_qdual(
     is_fp16=False,
     row_sr=False,
     col_sr=False,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """Compile the fused grouped mxfp4 dual quant. Shapes/recipes are baked.
 
@@ -118,6 +121,8 @@ def compile_grouped_mxfp4_qdual(
       3) ``kern``: the fused dual tile.
     ``bm`` (tile rows) must divide 128 (subset of the 512 col-pad align, so one
     tile stays within one group)."""
+    row_rht_mask = _normalize_rht_mask(row_rht_mask)
+    col_rht_mask = _normalize_rht_mask(col_rht_mask)
     # mxfp8-quant-style kernel: concurrent ROW/COL halves (256+256 of nth=512) sharing
     # the LDS tile, then a coalesced transposed COL write-back from an LDS stage
     # (ldsc). BK=256 -> each row-output store is 32 contiguous i32 = 128B coalesced
@@ -377,7 +382,7 @@ def compile_grouped_mxfp4_qdual(
                     for j in range_constexpr(4):
                         rbits.append(_half_to_f32bits(v4[j] & 0xFFFF, is_fp16))  # low 16b
                         rbits.append(_half_to_f32bits((v4[j] >> 16) & 0xFFFF, is_fp16))  # high 16b
-                vf = _microblock_vf(rbits, row_rht, fold_scale=True)
+                vf = _microblock_vf(rbits, row_rht, fold_scale=True, rht_mask=row_rht_mask)
                 native_bits, rbiased = _compute_scale_native(
                     _microblock_amax_f(vf),
                     SCALE_ROUNDING_BIAS,
@@ -415,7 +420,7 @@ def compile_grouped_mxfp4_qdual(
                         _half_to_f32bits(((w >> 16) & 0xFFFF) if chalf else (w & 0xFFFF), is_fp16)
                         for w in words
                     ]
-                    cvf = _microblock_vf(cbits, col_rht, fold_scale=True)
+                    cvf = _microblock_vf(cbits, col_rht, fold_scale=True, rht_mask=col_rht_mask)
                     cnative, cbiased = _compute_scale_native(
                         _microblock_amax_f(cvf),
                         SCALE_ROUNDING_BIAS,
@@ -495,6 +500,8 @@ def grouped_quant_mxfp4_raw(
     row_sr=False,
     col_sr=False,
     scale_rounding_mode=0,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """FlyDSL grouped mxfp4 dual quant, drop-in for the HIP grouped_quantize_mxfp4_dual
     (non-shuffle, non-2d recipes; SR supported = unbiased, not bit-exact). Returns the 6-tuple:
@@ -510,6 +517,8 @@ def grouped_quant_mxfp4_raw(
     assert group_lens.is_cuda and group_offs.is_cuda
     total_M, N = int(x.shape[0]), int(x.shape[1])
     G = int(group_lens.shape[0])
+    row_rht_mask = _normalize_rht_mask(row_rht_mask)
+    col_rht_mask = _normalize_rht_mask(col_rht_mask)
     assert N % MB == 0, f"N must be a multiple of {MB}"
     N_pad = (N + 127) // 128 * 128
     M_pad_col = (total_M + G * 256 + 255) // 256 * 256  # current-main producer/consumer contract
@@ -542,6 +551,8 @@ def grouped_quant_mxfp4_raw(
         int(bk),
         bool(row_sr),
         bool(col_sr),
+        row_rht_mask,
+        col_rht_mask,
         x.dtype,
     )
     comp = _GQ_MXFP4_CACHE.get(key)
@@ -564,6 +575,8 @@ def grouped_quant_mxfp4_raw(
             is_fp16=(x.dtype == torch.float16),
             row_sr=bool(row_sr),
             col_sr=bool(col_sr),
+            row_rht_mask=row_rht_mask,
+            col_rht_mask=col_rht_mask,
         )
         comp = _flyc.compile(
             launch,

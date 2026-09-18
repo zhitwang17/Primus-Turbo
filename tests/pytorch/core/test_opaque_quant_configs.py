@@ -19,6 +19,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
     Float8QuantConfig,
     ScalingRecipe,
+    rht_mask_from_seed,
 )
 
 _OPAQUE_CONFIGS = (Float8QuantConfig, Float4QuantConfig, ScalingRecipe)
@@ -58,6 +59,61 @@ def test_scaling_recipe_is_still_a_named_tuple():
     assert recipe._replace(use_sr=True).use_sr is True
     first, *_ = recipe
     assert first is True
+
+
+def test_randomized_rht_seed_contract_and_fx_round_trip():
+    assert rht_mask_from_seed(0) == 0
+    assert rht_mask_from_seed(1) == 0x514E28B7
+    assert rht_mask_from_seed(42) == 0x087FCD5C
+    assert rht_mask_from_seed(0xFFFFFFFF) == 0x81F16F39
+
+    recipe = ScalingRecipe(use_rht=True, rht_seed=42)
+    assert recipe.rht_mask == 0x087FCD5C
+    assert ScalingRecipe(use_rht=False, rht_seed=42).rht_mask == 0
+
+    config = Float4QuantConfig(rht_seed=42)
+    assert config.rht_mask == recipe.rht_mask
+    source, globals_ = config.__fx_repr__()
+    assert eval(source, dict(globals_)) == config
+
+    for bad_seed in (-1, 1 << 32):
+        with pytest.raises(ValueError, match="rht_seed must be"):
+            rht_mask_from_seed(bad_seed)
+        with pytest.raises(ValueError, match="rht_seed must be"):
+            ScalingRecipe(use_rht=False, rht_seed=bad_seed)
+        with pytest.raises(ValueError, match="rht_seed must be"):
+            Float4QuantConfig(rht_seed=bad_seed)
+
+
+def _rht32_reference(x, mask):
+    signs = torch.tensor([-1.0 if (mask >> i) & 1 else 1.0 for i in range(32)], dtype=x.dtype)
+    value = x * signs
+    halves = []
+    for half in value.reshape(2, 16):
+        transformed = half.clone()
+        width = 1
+        while width < 16:
+            transformed = transformed.reshape(-1, 2, width)
+            lo, hi = transformed[:, 0].clone(), transformed[:, 1].clone()
+            transformed[:, 0] = lo + hi
+            transformed[:, 1] = lo - hi
+            transformed = transformed.reshape(16)
+            width *= 2
+        halves.append(transformed * 0.25)
+    return torch.cat(halves)
+
+
+def test_randomized_rht_pairing_contract():
+    generator = torch.Generator().manual_seed(7)
+    left = torch.randn(32, generator=generator, dtype=torch.float64)
+    right = torch.randn(32, generator=generator, dtype=torch.float64)
+    mask = rht_mask_from_seed(42)
+
+    paired_dot = torch.dot(_rht32_reference(left, mask), _rht32_reference(right, mask))
+    torch.testing.assert_close(paired_dot, torch.dot(left, right), rtol=1e-12, atol=1e-12)
+
+    mismatched_dot = torch.dot(_rht32_reference(left, mask), _rht32_reference(right, rht_mask_from_seed(1)))
+    assert not torch.isclose(mismatched_dot, torch.dot(left, right), rtol=1e-4, atol=1e-4)
 
 
 def test_torch_version_that_needs_the_metaclass_is_the_one_we_have():

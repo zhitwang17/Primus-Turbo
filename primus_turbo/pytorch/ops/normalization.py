@@ -233,6 +233,7 @@ class _RMSNormFP4STE(torch.autograd.Function):
                 float4_e2m1fn_x2,
                 col_rht=col_recipe.use_rht,
                 scale_rounding_mode=config.scale_rounding_mode,
+                col_rht_mask=col_recipe.rht_mask,
             )
 
         def _wrap(data, scale_inv, shape, recipe, axis):
@@ -306,7 +307,7 @@ def rmsnorm_residual_fp4(
     assert x.dtype == torch.bfloat16, f"the fused dual is bf16-only, got {x.dtype}"
 
     row_recipe = ScalingRecipe()
-    col_recipe = ScalingRecipe(use_rht=True)
+    col_recipe = ScalingRecipe(use_rht=True, rht_seed=config.rht_seed)
 
     y, x_plus_r, rstd = _RMSNormResidualWithRstdFunction.apply(x, residual, gamma, eps, skip_y_store)
     H = gamma.shape[0]

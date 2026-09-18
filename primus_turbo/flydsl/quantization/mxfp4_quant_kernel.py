@@ -48,6 +48,14 @@ def _mxfp4_scale_rounding_bias(mode):
     return (1 << 21, 1 << 22, 3 << 19)[mode]
 
 
+def _normalize_rht_mask(rht_mask):
+    """Return a validated compile-time u32 Rademacher sign mask."""
+    rht_mask = int(rht_mask)
+    if not 0 <= rht_mask <= 0xFFFFFFFF:
+        raise ValueError("rht_mask must be in [0, 2**32 - 1]")
+    return rht_mask
+
+
 def _abs_i32(fbits):
     return fbits & 0x7FFFFFFF
 
@@ -226,13 +234,30 @@ def _rht16_pair(v, post_scale=True):
     return [r[i][0] for i in range_constexpr(16)] + [r[i][1] for i in range_constexpr(16)]
 
 
-def _microblock_vf(vbits, use_rht, fold_scale=False, scales=None):
+def _microblock_vf(vbits, use_rht, fold_scale=False, scales=None, rht_mask=0):
     """32 f32-bit i32 values -> list of 32 f32 Values (post-RHT if enabled).
     ``fold_scale`` drops the RHT's trailing ``*0.25``; see ``_rht16``. ``scales``
-    is applied before RHT so RMSNorm can fold rstd*gamma in without a bf16 trip."""
+    is applied before RHT so RMSNorm can fold rstd*gamma in without a bf16 trip.
+    ``rht_mask`` is a compile-time u32 Rademacher mask: bit ``i`` flips logical
+    element ``i`` before either H16. Mask 0 emits the original IR. Artificial +0
+    padding is kept as +0 so padded fp4 bytes retain their historical all-zero
+    representation."""
+    rht_mask = _normalize_rht_mask(rht_mask)
     vf = [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in vbits]
     if scales is not None:
         vf = [vf[i] * scales[i] for i in range_constexpr(32)]
+    if use_rht and rht_mask:
+        # Flip the f32 sign bit immediately before H16x2 (and after any fused
+        # RMSNorm scale). The bit tests are Python compile-time branches, so only
+        # set mask bits emit code. Preserve signed zero to keep fully padded
+        # microblocks byte-zero rather than producing -0.
+        sign_bit = fx.Int32(-0x80000000)
+        zero = fx.Int32(0)
+        for i in range_constexpr(32):
+            if rht_mask & (1 << i):
+                bits = Vec.from_elements([vf[i]], fx.Float32).bitcast(fx.Int32)[0]
+                bits = arith.select((bits & 0x7FFFFFFF) == zero, bits, bits ^ sign_bit)
+                vf[i] = Vec.from_elements([bits], fx.Int32).bitcast(fx.Float32)[0]
     if use_rht:
         if fold_scale:  # packed path: both H16 in <2 x float>, no trailing *0.25
             vf = _rht16_pair(vf, post_scale=False)
@@ -272,11 +297,11 @@ def _microblock_amax_f(vf):
     return Vec.from_elements([cur], fx.Float32).bitcast(fx.Int32)[0]
 
 
-def _finish_microblock(vbits, use_rht, scale_rounding_bias, seed=None, scales=None):
+def _finish_microblock(vbits, use_rht, scale_rounding_bias, seed=None, scales=None, rht_mask=0):
     """32 f32-bit i32 values -> (4 fp4 i32 words, scale_e8m0 i8-ready i32).
     ``seed`` (i32 Value) enables stochastic rounding in the final cvt (amax/scale
     stay deterministic); ``scales`` folds a per-element factor in before RHT."""
-    vf = _microblock_vf(vbits, use_rht, fold_scale=True, scales=scales)
+    vf = _microblock_vf(vbits, use_rht, fold_scale=True, scales=scales, rht_mask=rht_mask)
     amax = _microblock_amax_f(vf)
     native_bits, biased = _compute_scale_native(amax, scale_rounding_bias, exp_up=vf_exp_up(use_rht))
     words = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), seed)
@@ -400,6 +425,8 @@ def _emit_dual_body(
     GAMMA=None,
     tile_tr=None,
     tile_tc=None,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -567,7 +594,7 @@ def _emit_dual_body(
                     word = v4[j]
                     rbits.append(word << 16)
                     rbits.append(word & 0xFFFF0000)
-            vf = _microblock_vf(rbits, row_rht, fold_scale=True)
+            vf = _microblock_vf(rbits, row_rht, fold_scale=True, rht_mask=row_rht_mask)
             _lds_store1(lds.scr.ptr, r_row * tile_rmbc + cmb, _microblock_amax_f(vf))
             vf_hold.append(vf)
             meta.append((r_row, cmb))
@@ -612,6 +639,7 @@ def _emit_dual_body(
                 scale_rounding_bias,
                 seed=_row_seed(k),
                 scales=_rmsnorm_scales_row(r_row, cmb) if rmsnorm_scale else None,
+                rht_mask=row_rht_mask,
             )
             grow = _row0 + r_row
             gcmb = cblk * (tile_c // 32) + cmb
@@ -641,7 +669,7 @@ def _emit_dual_body(
                 word = _lds_load1(lds.buf.ptr, (row0 + row) * tile_cw + cw)
                 fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
                 cbits.append(fb)
-            vf = _microblock_vf(cbits, col_rht, fold_scale=True)
+            vf = _microblock_vf(cbits, col_rht, fold_scale=True, rht_mask=col_rht_mask)
             _lds_store1(lds.scr.ptr, mmb * _TC + c_col, _microblock_amax_f(vf))
             cvf_hold.append(vf)
         fx.barrier()
@@ -679,6 +707,7 @@ def _emit_dual_body(
                 scale_rounding_bias,
                 seed=_col_seed(mmb),
                 scales=_rmsnorm_scales_col(mmb, c_col) if rmsnorm_scale else None,
+                rht_mask=col_rht_mask,
             )
             gcol = _col0 + c_col
             gmmb = rblk * tile_rmb + mmb
@@ -693,7 +722,15 @@ def _emit_dual_body(
 
 
 def _build_dual_kernel(
-    row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False, row_sr=False, col_sr=False
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    col_locality=False,
+    row_sr=False,
+    col_sr=False,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """Single-recipe fused LDS dual (one coalesced 32x256 tile load feeds both the
     rowwise and colwise-transpose casts). Thin wrapper over ``_emit_dual_body``.
@@ -737,15 +774,35 @@ def _build_dual_kernel(
             col_sr=col_sr,
             sr_seed=SR_SEED,
             sr_gbid=fx.block_idx.x,
+            row_rht_mask=row_rht_mask,
+            col_rht_mask=col_rht_mask,
         )
 
     return _dual_kernel
 
 
 def _build_dual_launch(
-    row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False, row_sr=False, col_sr=False
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    col_locality=False,
+    row_sr=False,
+    col_sr=False,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
-    kern = _build_dual_kernel(row_rht, col_rht, row_2d, col_2d, col_locality, row_sr, col_sr)
+    kern = _build_dual_kernel(
+        row_rht,
+        col_rht,
+        row_2d,
+        col_2d,
+        col_locality,
+        row_sr,
+        col_sr,
+        row_rht_mask,
+        col_rht_mask,
+    )
 
     @flyc.jit
     def _dual_launch(
@@ -798,6 +855,8 @@ def flydsl_dual_quant(
     row_sr=False,
     col_sr=False,
     scale_rounding_mode=0,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """Fused rowwise + colwise-transpose mxfp4 cast (one bf16 read). Returns
     (row_data, row_scale, col_data, col_scale) in C++-compatible dtypes/shapes.
@@ -811,7 +870,18 @@ def flydsl_dual_quant(
     rs = torch.empty((R, C // 32), dtype=torch.uint8, device=dev)
     co = torch.empty((C, R // 8), dtype=torch.int32, device=dev)
     cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
-    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
+    fn, grid_x = get_dual_cast(
+        R,
+        C,
+        row_rht,
+        col_rht,
+        row_2d,
+        col_2d,
+        row_sr,
+        col_sr,
+        row_rht_mask,
+        col_rht_mask,
+    )
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
     fn(
         x_i32,
@@ -833,16 +903,47 @@ def flydsl_dual_quant(
     return row_data, row_scale, col_data, col_scale
 
 
-def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False):
+def get_dual_cast(
+    R,
+    C,
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    row_sr=False,
+    col_sr=False,
+    row_rht_mask=0,
+    col_rht_mask=0,
+):
     """Return (compiled_fn, grid_x) for the fused dual at
     (R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr).
     Requires R % 128 == 0 and C % 256 == 0 (no scale/output padding)."""
+    row_rht_mask = _normalize_rht_mask(row_rht_mask)
+    col_rht_mask = _normalize_rht_mask(col_rht_mask)
     col_locality = int(C) > int(R)  # C>R (down-proj): combine transpose stores
-    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality, bool(row_sr), bool(col_sr))
+    lk = (
+        bool(row_rht),
+        bool(col_rht),
+        bool(row_2d),
+        bool(col_2d),
+        col_locality,
+        bool(row_sr),
+        bool(col_sr),
+        row_rht_mask,
+        col_rht_mask,
+    )
     raw = _DUAL_LAUNCH.get(lk)
     if raw is None:
         raw = _build_dual_launch(
-            bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality, bool(row_sr), bool(col_sr)
+            bool(row_rht),
+            bool(col_rht),
+            bool(row_2d),
+            bool(col_2d),
+            col_locality,
+            bool(row_sr),
+            bool(col_sr),
+            row_rht_mask,
+            col_rht_mask,
         )
         _DUAL_LAUNCH[lk] = raw
     key = (
@@ -854,6 +955,8 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=Fal
         bool(col_2d),
         bool(row_sr),
         bool(col_sr),
+        row_rht_mask,
+        col_rht_mask,
     )
     ent = _DUAL_COMPILED.get(key)
     if ent is None:
@@ -876,7 +979,7 @@ _RMSNORM_DUAL_LAUNCH = {}
 _RMSNORM_DUAL_COMPILED = {}
 
 
-def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
+def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False, row_rht_mask=0, col_rht_mask=0):
     """Dual of residual-sum ``xpr`` with in-register ``rstd*gamma`` (activation recipe)."""
 
     @fx.struct
@@ -927,13 +1030,15 @@ def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
             GAMMA=GAMMA,
             tile_tr=_RMS_TR,
             tile_tc=_RMS_TC,
+            row_rht_mask=row_rht_mask,
+            col_rht_mask=col_rht_mask,
         )
 
     return _rmsnorm_dual_kernel
 
 
-def _build_rmsnorm_dual_launch(row_rht, col_rht, col_locality=False):
-    kern = _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality)
+def _build_rmsnorm_dual_launch(row_rht, col_rht, col_locality=False, row_rht_mask=0, col_rht_mask=0):
+    kern = _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality, row_rht_mask, col_rht_mask)
 
     @flyc.jit
     def _rmsnorm_dual_launch(
@@ -958,7 +1063,15 @@ def _build_rmsnorm_dual_launch(row_rht, col_rht, col_locality=False):
     return _rmsnorm_dual_launch
 
 
-def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=True, scale_rounding_mode=0):
+def flydsl_rmsnorm_dual_quant(
+    xpr_bf16,
+    rstd_f32,
+    gamma_f32,
+    fp4_dtype,
+    col_rht=True,
+    scale_rounding_mode=0,
+    col_rht_mask=0,
+):
     """MXFP4 dual of ``y = xpr * rstd[:,None] * gamma`` without a BF16 ``y`` load.
 
     ``xpr_bf16`` is ``[R, C]`` bf16 (residual sum). ``rstd_f32`` is ``[R]``.
@@ -988,7 +1101,7 @@ def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=
     rs = torch.empty((R, C // 32), dtype=torch.uint8, device=dev)
     co = torch.empty((C, R // 8), dtype=torch.int32, device=dev)
     cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
-    fn, grid_x = get_rmsnorm_dual_cast(R, C, False, bool(col_rht))
+    fn, grid_x = get_rmsnorm_dual_cast(R, C, False, bool(col_rht), row_rht_mask=0, col_rht_mask=col_rht_mask)
     fn(
         x_i32,
         ro,
@@ -1011,14 +1124,18 @@ def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=
     return row_data, row_scale, col_data, col_scale
 
 
-def get_rmsnorm_dual_cast(R, C, row_rht, col_rht):
+def get_rmsnorm_dual_cast(R, C, row_rht, col_rht, row_rht_mask=0, col_rht_mask=0):
+    row_rht_mask = _normalize_rht_mask(row_rht_mask)
+    col_rht_mask = _normalize_rht_mask(col_rht_mask)
     col_locality = int(C) > int(R)
-    lk = (bool(row_rht), bool(col_rht), col_locality)
+    lk = (bool(row_rht), bool(col_rht), col_locality, row_rht_mask, col_rht_mask)
     raw = _RMSNORM_DUAL_LAUNCH.get(lk)
     if raw is None:
-        raw = _build_rmsnorm_dual_launch(bool(row_rht), bool(col_rht), col_locality)
+        raw = _build_rmsnorm_dual_launch(
+            bool(row_rht), bool(col_rht), col_locality, row_rht_mask, col_rht_mask
+        )
         _RMSNORM_DUAL_LAUNCH[lk] = raw
-    key = (int(R), int(C), bool(row_rht), bool(col_rht))
+    key = (int(R), int(C), bool(row_rht), bool(col_rht), row_rht_mask, col_rht_mask)
     ent = _RMSNORM_DUAL_COMPILED.get(key)
     if ent is None:
         import torch
@@ -1052,6 +1169,8 @@ def _build_dual3_kernel(
     row_sr=False,
     col_sr=False,
     scale_rounding_bias=1 << 21,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
@@ -1118,6 +1237,8 @@ def _build_dual3_kernel(
             col_sr=col_sr,
             sr_seed=SR_SEED,
             sr_gbid=_pid,
+            row_rht_mask=row_rht_mask,
+            col_rht_mask=col_rht_mask,
         )
 
     return _dual3_kernel
@@ -1133,6 +1254,8 @@ def _build_dual3_launch(
     row_sr=False,
     col_sr=False,
     scale_rounding_bias=1 << 21,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     kern = _build_dual3_kernel(
         row_rht,
@@ -1144,6 +1267,8 @@ def _build_dual3_launch(
         row_sr,
         col_sr,
         scale_rounding_bias,
+        row_rht_mask,
+        col_rht_mask,
     )
 
     @flyc.jit
@@ -1209,12 +1334,16 @@ def get_dual3_cast(
     row_sr=False,
     col_sr=False,
     scale_rounding_bias=1 << 21,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """(compiled_fn, grid_x, K_pad, N_pad, padded) for the batched-3D dual at
     (N,K,G,recipes). K_pad=ceil(K/128)*128 (row-out), N_pad=ceil(N/128)*128 (col-out);
     `padded` when K not a 256-tile multiple or N not 128-multiple."""
     Kp = ((K + 127) // 128) * 128
     Np = ((N + 127) // 128) * 128
+    row_rht_mask = _normalize_rht_mask(row_rht_mask)
+    col_rht_mask = _normalize_rht_mask(col_rht_mask)
     tr, tc = _pick_tile_geom(int(N), int(K))
     padded = (K % tc != 0) or (N % 128 != 0)
     col_locality = int(K) > int(N)  # K>N: combine transpose stores (col-out)
@@ -1231,6 +1360,8 @@ def get_dual3_cast(
         bool(row_sr),
         bool(col_sr),
         int(scale_rounding_bias),
+        row_rht_mask,
+        col_rht_mask,
     )
     lk = lk + (tr, tc)
     _saved = (_TR, _TC)
@@ -1247,6 +1378,8 @@ def get_dual3_cast(
             bool(row_sr),
             bool(col_sr),
             int(scale_rounding_bias),
+            row_rht_mask,
+            col_rht_mask,
         )
         _DUAL3_LAUNCH[lk] = raw
     key = (int(N), int(K), int(G), *lk)
@@ -1297,6 +1430,8 @@ def flydsl_dual_quant_batched(
     row_sr=False,
     col_sr=False,
     scale_rounding_mode=0,
+    row_rht_mask=0,
+    col_rht_mask=0,
 ):
     """Batched-3D fused rowwise + colwise-transpose mxfp4 dual cast for a [G,N,K]
     weight in ONE launch. Returns C++-compatible per-expert
@@ -1319,6 +1454,8 @@ def flydsl_dual_quant_batched(
         row_sr,
         col_sr,
         scale_rounding_bias,
+        row_rht_mask,
+        col_rht_mask,
     )
     # Outputs sized on K_pad/N_pad; the pad regions must read back all-0 to match the HIP
     # dual (the GEMM contracts over the PADDED extent, so pad garbage would corrupt it).

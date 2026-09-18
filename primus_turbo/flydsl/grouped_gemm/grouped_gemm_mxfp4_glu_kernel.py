@@ -73,6 +73,7 @@ def _glu_entry(
     dglu_epi_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    rht_mask=0,
     activation="silu",
     clamp_limit=None,
     scale_rounding_bias=1 << 21,
@@ -97,6 +98,7 @@ def _glu_entry(
         dglu_epi_quant,
         epi_row_sr,
         epi_col_sr,
+        rht_mask,
         activation,
         clamp_limit,
         scale_rounding_bias,
@@ -125,6 +127,7 @@ def _glu_entry(
             dglu_epi_quant=dglu_epi_quant,
             epi_row_sr=epi_row_sr,
             epi_col_sr=epi_col_sr,
+            epi_rht_mask=rht_mask,
             activation=activation,
             clamp_limit=clamp_limit,
             epi_scale_rounding_bias=scale_rounding_bias,
@@ -190,6 +193,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
     row_use_sr: bool = False,
     col_use_sr: bool = False,
     scale_rounding_mode: int = 0,
+    rht_mask: int = 0,
     out_dtype=torch.bfloat16,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """fc1 GLU whose activation is quantised in the epilogue, never reaching bf16.
@@ -218,6 +222,8 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
             uses.
         col_use_sr: the same for the col-wise operand, off a salted seed so a block the
             two share does not draw one sequence twice.
+        rht_mask: compile-time Rademacher signs for the col-wise operand's logical
+            32-value block. Zero preserves the historical fixed H16 transforms.
     """
     _check_activation(activation)
     _check_clamp_limit(clamp_limit)
@@ -244,6 +250,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
         epi_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        rht_mask=rht_mask,
         activation=activation,
         clamp_limit=clamp_limit,
         scale_rounding_bias=_mxfp4_scale_rounding_bias(scale_rounding_mode),
@@ -332,6 +339,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     row_use_sr: bool = False,
     col_use_sr: bool = False,
     scale_rounding_mode: int = 0,
+    rht_mask: int = 0,
     out_dtype=torch.bfloat16,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """fc2 dgrad whose ``grad_l1`` is quantised in the epilogue, never reaching bf16.
@@ -361,6 +369,8 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
             the same id the standalone quantiser uses.
         col_use_sr: the same for the col-wise operand, off a salted seed so a block
             the two share does not draw one sequence twice.
+        rht_mask: compile-time Rademacher signs for the col-wise operand's logical
+            32-value block. Zero preserves the historical fixed H16 transforms.
 
     Returns:
         ``(row_out, row_sc, col_out, col_sc)``.
@@ -400,6 +410,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
         dglu_epi_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        rht_mask=rht_mask,
         activation=activation,
         clamp_limit=clamp_limit,
         scale_rounding_bias=_mxfp4_scale_rounding_bias(scale_rounding_mode),

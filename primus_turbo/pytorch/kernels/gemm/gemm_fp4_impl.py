@@ -277,7 +277,6 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
-
         # No path for AITER-preshuffled inputs (this backend preshuffles raw E8M0 itself).
         if preshuffled:
             return False
@@ -548,6 +547,7 @@ def gemm_fp4_glu_quant_impl(
     row_use_sr: bool,
     col_use_sr: bool,
     scale_rounding_mode: int,
+    rht_mask: int,
     activation: str,
     clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -574,6 +574,7 @@ def gemm_fp4_glu_quant_impl(
         row_use_sr=row_use_sr,
         col_use_sr=col_use_sr,
         scale_rounding_mode=scale_rounding_mode,
+        rht_mask=rht_mask,
         activation=activation,
         clamp_limit=clamp_limit,
     )
@@ -591,10 +592,21 @@ def gemm_fp4_glu_quant_impl_meta(
     row_use_sr: bool,
     col_use_sr: bool,
     scale_rounding_mode: int,
+    rht_mask: int,
     activation: str,
     clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del a_scale_inv, b_scale_inv, probs, row_use_sr, col_use_sr, scale_rounding_mode, activation, clamp_limit
+    del (
+        a_scale_inv,
+        b_scale_inv,
+        probs,
+        row_use_sr,
+        col_use_sr,
+        scale_rounding_mode,
+        rht_mask,
+        activation,
+        clamp_limit,
+    )
     M, two_i = a.shape[0], b.shape[0]
     I = two_i // 2
     row_out, row_sc, col_out, col_sc = _alloc_dense_act_buffers(M, I, a.device)
@@ -619,6 +631,7 @@ def gemm_fp4_dglu_quant_impl(
     row_use_sr: bool,
     col_use_sr: bool,
     scale_rounding_mode: int,
+    rht_mask: int,
     activation: str,
     clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -645,6 +658,7 @@ def gemm_fp4_dglu_quant_impl(
         row_use_sr=row_use_sr,
         col_use_sr=col_use_sr,
         scale_rounding_mode=scale_rounding_mode,
+        rht_mask=rht_mask,
         activation=activation,
         clamp_limit=clamp_limit,
     )
@@ -663,6 +677,7 @@ def gemm_fp4_dglu_quant_impl_meta(
     row_use_sr: bool,
     col_use_sr: bool,
     scale_rounding_mode: int,
+    rht_mask: int,
     activation: str,
     clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -675,6 +690,7 @@ def gemm_fp4_dglu_quant_impl_meta(
         row_use_sr,
         col_use_sr,
         scale_rounding_mode,
+        rht_mask,
         activation,
         clamp_limit,
     )

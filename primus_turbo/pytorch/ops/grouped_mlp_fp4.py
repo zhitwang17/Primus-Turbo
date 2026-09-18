@@ -16,6 +16,7 @@ wgrad operands only, and every GEMM is NT.
          wgrad              : the col-wise (rht=T) operands, contract M
 """
 
+from dataclasses import replace
 from typing import Optional, Union
 
 import torch
@@ -200,7 +201,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
 
         # x's col-wise half is a wgrad operand, so it is the one that carries the RHT.
         x_scaling_recipe = ScalingRecipe()
-        x_t_scaling_recipe = ScalingRecipe(use_rht=True)
+        x_t_scaling_recipe = ScalingRecipe(use_rht=True, rht_seed=config.rht_seed)
         if not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp4_with_trans(
                 x,
@@ -253,7 +254,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             probs=probs,
             config=config,
             out_row_scaling_recipe=ScalingRecipe(),
-            out_col_scaling_recipe=ScalingRecipe(use_rht=True),
+            out_col_scaling_recipe=ScalingRecipe(use_rht=True, rht_seed=config.rht_seed),
             activation=activation,
             clamp_limit=clamp_limit,
         )
@@ -290,7 +291,9 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         )
         ctx.activation = activation
         ctx.clamp_limit = clamp_limit
-        ctx.config = config
+        # The config is mutable.  Snapshot it so changing a reused campaign
+        # config between forward and backward cannot mismatch the paired RHT.
+        ctx.config = replace(config)
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.fuse_w1_accum = fuse_w1_accum
@@ -337,7 +340,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             group_offs,
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(use_sr=sr),
-            scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True),
+            scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True, rht_seed=ctx.config.rht_seed),
             scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
 
@@ -375,7 +378,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             intermediate=l1,
             config=ctx.config,
             out_row_scaling_recipe=ScalingRecipe(use_sr=sr),
-            out_col_scaling_recipe=ScalingRecipe(use_sr=sr, use_rht=True),
+            out_col_scaling_recipe=ScalingRecipe(use_sr=sr, use_rht=True, rht_seed=ctx.config.rht_seed),
             activation=ctx.activation,
             clamp_limit=ctx.clamp_limit,
         )

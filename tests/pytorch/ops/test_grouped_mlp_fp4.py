@@ -148,3 +148,43 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit, scale_rounding_mode):
         keys = tuple(_GMXFP4_GLU_CACHE)
         assert any(key[13] and key[-1] == expected_bias for key in keys), "fused GLU mode"
         assert any(key[14] and key[-1] == expected_bias for key in keys), "fused dGLU mode"
+
+
+def test_grouped_mlp_fp4_randomized_rht():
+    """Static random signs preserve non-wgrad math and keep both grouped wgrads accurate."""
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    M, K, I, G = SHAPES[0]
+    offs, group_lens, leaves = _mlp_leaves(M, K, I, G)
+    cotangent = torch.randn(M, K, device="cuda", generator=torch.Generator(device="cuda").manual_seed(7))
+
+    def run_with_seed(seed):
+        return _run(
+            lambda x, w1, w2, p: grouped_mlp_fp4(
+                x,
+                w1,
+                w2,
+                group_lens,
+                probs=p,
+                trans_w1=True,
+                trans_w2=True,
+                config=Float4QuantConfig(rht_seed=seed),
+                activation="silu",
+            ),
+            leaves,
+            cotangent,
+        )
+
+    fixed_out, fixed_grads = run_with_seed(0)
+    random_out, random_grads = run_with_seed(42)
+    ref, ref_grads = _run(lambda x, w1, w2, p: _mlp_ref(x, w1, w2, p, offs, "silu"), leaves, cotangent)
+
+    assert torch.equal(fixed_out, random_out)
+    assert torch.equal(fixed_grads[0], random_grads[0]), "grad_x must not depend on the RHT mask"
+    assert torch.equal(fixed_grads[3], random_grads[3]), "grad_probs must not depend on the RHT mask"
+    assert compute_snr(ref, random_out) > SNR_THRESHOLD
+    for name, got, want in zip(("grad_w1", "grad_w2"), random_grads[1:3], ref_grads[1:3]):
+        assert compute_snr(want, got) > SNR_THRESHOLD, name
+    assert any(not torch.equal(a, b) for a, b in zip(fixed_grads[1:3], random_grads[1:3]))

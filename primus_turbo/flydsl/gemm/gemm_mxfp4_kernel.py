@@ -1656,6 +1656,7 @@ def _build_mxfp4_gemm_kernel(
     dglu_act_quant: bool = False,  # StoreCdSwiGLUQuadQuant; dglu, no _CSTORE
     epi_row_sr: bool = False,
     epi_col_sr: bool = False,
+    epi_rht_mask: int = 0,
     epi_activation: str = "silu",
     epi_clamp_limit=None,
 ):
@@ -1727,6 +1728,8 @@ def _build_mxfp4_gemm_kernel(
         "StoreCdSwiGLUQuadQuant needs dglu, even n_tiles_a, n_tiles_b==4, I%32==0"
     )
     assert not (epi_row_sr or epi_col_sr) or glu_act_quant or dglu_act_quant
+    assert isinstance(epi_rht_mask, int) and 0 <= epi_rht_mask <= 0xFFFFFFFF
+    assert not epi_rht_mask or glu_act_quant or dglu_act_quant
     # B's g2s permutes source columns so a lane's n-fragments land adjacent and pack into dwordx2.
     _BILV = N_TILES_BH if _CSTORE else 0
     _HALF_N = (not glu) and (not dglu) and (0 < n_tail <= LDS_BN_HALF)
@@ -1914,6 +1917,7 @@ def _build_mxfp4_gemm_kernel(
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=sr_seed,
+                    rht_mask=epi_rht_mask,
                 )
                 assert 4 * LDS_WORDS_PER_WAVE * 4 <= NBB * bh_lds_size
                 store_c = StoreCSwiGLUQuant(*_glu_args, quant_store=_q, **_glu_kw)
@@ -1977,6 +1981,7 @@ def _build_mxfp4_gemm_kernel(
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=sr_seed,
+                    rht_mask=epi_rht_mask,
                 )
                 store_c = StoreCdSwiGLUQuadQuant(*_dglu_args, quant_store=_q, **_dglu_kw)
             else:
@@ -2694,6 +2699,7 @@ def _compile_mxfp4_fused(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    epi_rht_mask=0,
     epi_activation="silu",
     epi_clamp_limit=None,
 ):
@@ -2730,6 +2736,7 @@ def _compile_mxfp4_fused(
         dglu_act_quant=dglu_act_quant,
         epi_row_sr=epi_row_sr,
         epi_col_sr=epi_col_sr,
+        epi_rht_mask=epi_rht_mask,
         epi_activation=epi_activation,
         epi_clamp_limit=epi_clamp_limit,
     )
@@ -2902,6 +2909,7 @@ def _get_mxfp4_fused_launch(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    epi_rht_mask=0,
     epi_activation="silu",
     epi_clamp_limit=None,
 ):
@@ -2928,6 +2936,7 @@ def _get_mxfp4_fused_launch(
         dglu_act_quant,
         epi_row_sr,
         epi_col_sr,
+        epi_rht_mask,
         epi_activation,
         epi_clamp_limit,
     )
@@ -2956,6 +2965,7 @@ def _get_mxfp4_fused_launch(
             dglu_act_quant=dglu_act_quant,
             epi_row_sr=epi_row_sr,
             epi_col_sr=epi_col_sr,
+            epi_rht_mask=epi_rht_mask,
             epi_activation=epi_activation,
             epi_clamp_limit=epi_clamp_limit,
         )
@@ -3385,12 +3395,15 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
     row_use_sr: bool = False,
     col_use_sr: bool = False,
     scale_rounding_mode: int = 0,
+    rht_mask: int = 0,
     activation: str = "silu",
     clamp_limit=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense MXFP4 NT GEMM + StoreCSwiGLUQuant: act never hits BF16 HBM.
 
     Writes ``l1[M, 2I]`` BF16 and the row/col MXFP4 pair fc2 / wgrad consume.
+    ``rht_mask`` is the compile-time Rademacher sign mask applied only to the
+    col-wise operand before its two H16 transforms; zero preserves fixed RHT.
     """
     from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
         _mxfp4_scale_rounding_bias,
@@ -3448,6 +3461,7 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
         glu_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        epi_rht_mask=rht_mask,
         epi_activation=activation,
         epi_clamp_limit=clamp_limit,
     )
@@ -3473,7 +3487,22 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
         scale_rounding_bias,
         stream,
     )
-    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr, activation, clamp_limit)
+    at_key = (
+        M,
+        I,
+        K,
+        _row_b,
+        gm,
+        xcd,
+        gn,
+        10,
+        9,
+        row_use_sr,
+        col_use_sr,
+        rht_mask,
+        activation,
+        clamp_limit,
+    )
     entry = _MXFP4_GLU_QUANT_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]
@@ -3524,6 +3553,7 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
     row_use_sr: bool = False,
     col_use_sr: bool = False,
     scale_rounding_mode: int = 0,
+    rht_mask: int = 0,
     activation: str = "silu",
     clamp_limit=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3531,6 +3561,7 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
 
     ``a`` is fc2 ``dY`` row-quant, ``b`` is ``w2`` col-quant. Accumulator is
     ``dact[M, I]``; ``grad_l1[M, 2I]`` never hits BF16 HBM.
+    ``rht_mask`` is applied only to the col-wise operand before its H16s.
     """
     from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
         _mxfp4_scale_rounding_bias,
@@ -3589,6 +3620,7 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
         dglu_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        epi_rht_mask=rht_mask,
         epi_activation=activation,
         epi_clamp_limit=clamp_limit,
     )
@@ -3615,7 +3647,23 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
         scale_rounding_bias,
         stream,
     )
-    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr, activation, clamp_limit, "dglu")
+    at_key = (
+        M,
+        I,
+        K,
+        _row_b,
+        gm,
+        xcd,
+        gn,
+        10,
+        9,
+        row_use_sr,
+        col_use_sr,
+        rht_mask,
+        activation,
+        clamp_limit,
+        "dglu",
+    )
     entry = _MXFP4_DGLU_QUANT_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]

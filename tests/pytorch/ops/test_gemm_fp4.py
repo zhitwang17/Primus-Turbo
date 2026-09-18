@@ -766,7 +766,7 @@ def _mlp_fp4_leaves(dtype, seed=42, mki=None):
     return x, w1, w2, grad_out
 
 
-def _mlp_fp4_run(dtype, prequantize_x=False, activation="silu", clamp_limit=None, mki=None):
+def _mlp_fp4_run(dtype, prequantize_x=False, activation="silu", clamp_limit=None, mki=None, rht_seed=0):
     from primus_turbo.pytorch.core.quantized_tensor import (
         QuantizedTensor,
         QuantizedTensorPair,
@@ -779,7 +779,7 @@ def _mlp_fp4_run(dtype, prequantize_x=False, activation="silu", clamp_limit=None
         # data is the row-wise operand, data_t the col-wise (RHT) wgrad one.
         from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
 
-        row_recipe, col_recipe = ScalingRecipe(), ScalingRecipe(use_rht=True)
+        row_recipe, col_recipe = ScalingRecipe(), ScalingRecipe(use_rht=True, rht_seed=rht_seed)
         row, row_scale, col, col_scale = quantize_fp4_with_trans(
             x.detach(),
             float4_e2m1fn_x2,
@@ -807,7 +807,14 @@ def _mlp_fp4_run(dtype, prequantize_x=False, activation="silu", clamp_limit=None
             _wrap(row, row_scale, torch.Size((m, k)), row_recipe, -1),
             _wrap(col, col_scale, torch.Size((k, m)), col_recipe, -2),
         )
-    out = mlp_fp4(x_in, w1, w2, activation=activation, clamp_limit=clamp_limit)
+    out = mlp_fp4(
+        x_in,
+        w1,
+        w2,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        config=Float4QuantConfig(rht_seed=rht_seed),
+    )
     out.backward(grad_out)
     return out.detach(), (None if prequantize_x else x.grad), w1.grad, w2.grad
 
@@ -862,6 +869,53 @@ def test_mlp_fp4_mx_blockwise(mki, activation, clamp_limit):
         assert snr > floor, f"{name} snr too low"
 
 
+def test_mlp_fp4_randomized_rht_preserves_forward_and_dgrad():
+    """Random signs only change paired wgrad quantization, never the forward or dgrad."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    ref = _mlp_fp4_reference(torch.bfloat16)
+    fixed = _mlp_fp4_run(torch.bfloat16, rht_seed=0)
+    randomized = _mlp_fp4_run(torch.bfloat16, rht_seed=42)
+
+    assert torch.equal(fixed[0], randomized[0]), "forward rowwise path must not depend on RHT mask"
+    assert torch.equal(fixed[1], randomized[1]), "dgrad rowwise path must not depend on RHT mask"
+    for name, want, got in zip(_MLP_FP4_TENSORS[2:], ref[2:], randomized[2:]):
+        snr = compute_snr(want.float(), got.float())
+        print(f"randomized-{name}-SNR: {snr:.2f} dB")
+        assert snr > _MLP_SNR_THRESHOLD, f"{name} snr too low"
+    assert any(not torch.equal(a, b) for a, b in zip(fixed[2:], randomized[2:])), (
+        "a non-zero randomized-RHT seed should change at least one weight gradient"
+    )
+
+
+def test_mlp_fp4_snapshots_randomized_rht_config_for_backward():
+    """Mutating a reused config after forward must not mismatch wgrad's RHT pair."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+    from primus_turbo.pytorch.ops import mlp_fp4
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    expected = _mlp_fp4_run(torch.bfloat16, rht_seed=42)
+    x, w1, w2, grad_out = _mlp_fp4_leaves(torch.bfloat16)
+    config = Float4QuantConfig(rht_seed=42)
+    out = mlp_fp4(x, w1, w2, config=config)
+
+    # A campaign controller may reuse the object for the next launch before
+    # this graph's backward runs.  Backward must retain forward's seed 42.
+    config.rht_seed = 1
+    out.backward(grad_out)
+    got = out.detach(), x.grad, w1.grad, w2.grad
+
+    for name, want, actual in zip(_MLP_FP4_TENSORS, expected, got):
+        assert torch.equal(want, actual), f"{name} changed after mutating the caller's config"
+
+
 def test_mlp_fp4_accepts_a_prequantized_x():
     """A caller that already has x quantized must get the same numbers.
 
@@ -903,8 +957,9 @@ def test_rmsnorm_residual_fp4_feeds_mlp_fp4():
     w1 = (torch.randn((2 * i, k), dtype=torch.bfloat16, device=device) * 0.02).requires_grad_(True)
     w2 = (torch.randn((k, i), dtype=torch.bfloat16, device=device) * 0.02).requires_grad_(True)
 
-    y, x_plus_r, y_fp4 = rmsnorm_residual_fp4(x, residual, gamma)
-    out = mlp_fp4(y_fp4, w1, w2)
+    config = Float4QuantConfig(rht_seed=42)
+    y, x_plus_r, y_fp4 = rmsnorm_residual_fp4(x, residual, gamma, config=config)
+    out = mlp_fp4(y_fp4, w1, w2, config=config)
     out.backward(torch.randn_like(out) * 0.1)
 
     assert out.shape == (m, k)

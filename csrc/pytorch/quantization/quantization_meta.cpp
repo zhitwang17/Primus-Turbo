@@ -10,6 +10,11 @@
 
 namespace primus_turbo::pytorch {
 
+static inline void validate_rht_mask(const int64_t mask, const char *name) {
+    PRIMUS_TURBO_CHECK(mask >= 0 && mask <= 0xffffffffLL, name,
+                       " must be in [0, 0xffffffff]. But got ", mask);
+}
+
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
                                                      c10::optional<at::Tensor> scale_opt,
@@ -163,8 +168,11 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
     const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
     const bool shuffle_rowwise_scale, const bool shuffle_rowwise, const bool shuffle_colwise_scale,
-    const bool shuffle_colwise, const int64_t scale_rounding_mode) {
+    const bool shuffle_colwise, const int64_t scale_rounding_mode, const int64_t rowwise_rht_mask,
+    const int64_t colwise_rht_mask) {
     using namespace primus_turbo::detail;
+    validate_rht_mask(rowwise_rht_mask, "rowwise_rht_mask");
+    validate_rht_mask(colwise_rht_mask, "colwise_rht_mask");
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
         return (a + b - 1) / b;
@@ -263,13 +271,13 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
             colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale.view(at::kFloat8_e8m0fnu)};
 }
 
-std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                                            const int64_t axis, const int64_t padding_align_size,
-                                            const bool use_2d_block, const bool use_sr,
-                                            const bool use_rht, const bool shuffle_scale,
-                                            const bool    shuffle_out,
-                                            const int64_t scale_rounding_mode) {
+std::vector<at::Tensor>
+quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype, const int64_t axis,
+                    const int64_t padding_align_size, const bool use_2d_block, const bool use_sr,
+                    const bool use_rht, const bool shuffle_scale, const bool shuffle_out,
+                    const int64_t scale_rounding_mode, const int64_t rht_mask) {
     using namespace primus_turbo::detail;
+    validate_rht_mask(rht_mask, "rht_mask");
 
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
 
@@ -580,8 +588,11 @@ std::vector<at::Tensor> grouped_quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
     const at::ScalarType dest_dtype, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
     const bool rowwise_use_rht, const bool colwise_use_2d_block, const bool colwise_use_sr,
-    const bool colwise_use_rht, const int64_t scale_rounding_mode) {
+    const bool colwise_use_rht, const int64_t scale_rounding_mode, const int64_t rowwise_rht_mask,
+    const int64_t colwise_rht_mask) {
     using namespace primus_turbo::detail;
+    validate_rht_mask(rowwise_rht_mask, "rowwise_rht_mask");
+    validate_rht_mask(colwise_rht_mask, "colwise_rht_mask");
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
 
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
@@ -629,12 +640,12 @@ std::vector<at::Tensor> grouped_quantize_mxfp4_dual_meta(
             group_offs_padded_colwise};
 }
 
-std::vector<at::Tensor>
-grouped_quantize_mxfp4_meta(const at::Tensor input, const at::Tensor group_lens,
-                            const at::Tensor group_offs, const at::ScalarType dest_dtype,
-                            const int64_t axis, const bool use_2d_block, const bool use_sr,
-                            const bool use_rht, const int64_t scale_rounding_mode) {
+std::vector<at::Tensor> grouped_quantize_mxfp4_meta(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const int64_t axis, const bool use_2d_block, const bool use_sr,
+    const bool use_rht, const int64_t scale_rounding_mode, const int64_t rht_mask) {
     using namespace primus_turbo::detail;
+    validate_rht_mask(rht_mask, "rht_mask");
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
 
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,

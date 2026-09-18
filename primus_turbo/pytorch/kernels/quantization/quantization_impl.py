@@ -739,6 +739,8 @@ def grouped_quantize_mxfp4_impl(
                 scaling_recipe_for_trans.use_sr,
                 scaling_recipe_for_trans.use_rht,
                 scale_rounding_mode,
+                scaling_recipe.rht_mask,
+                scaling_recipe_for_trans.rht_mask,
             )
 
         # FlyDSL grouped dual quant (bit-exact for bf16, faster than the HIP dual) for
@@ -770,6 +772,8 @@ def grouped_quantize_mxfp4_impl(
                 row_sr=scaling_recipe.use_sr,
                 col_sr=scaling_recipe_for_trans.use_sr,
                 scale_rounding_mode=scale_rounding_mode,
+                row_rht_mask=scaling_recipe.rht_mask,
+                col_rht_mask=scaling_recipe_for_trans.rht_mask,
             )
             # Adapt the FlyDSL raw 6-tuple to main's 8-tuple dual contract: rowwise is
             # tight-M, so its padded layout equals the original group_lens / group_offs.
@@ -812,6 +816,7 @@ def grouped_quantize_mxfp4_impl(
                     scaling_recipe.use_rht,
                     col_sr=scaling_recipe.use_sr,  # rowwise discarded -> only col SR matters
                     scale_rounding_mode=scale_rounding_mode,
+                    col_rht_mask=scaling_recipe.rht_mask,
                 )
             )
             return colwise_out, colwise_scale, group_lens_padded, group_offs_padded
@@ -825,6 +830,7 @@ def grouped_quantize_mxfp4_impl(
             scaling_recipe.use_sr,
             scaling_recipe.use_rht,
             scale_rounding_mode,
+            scaling_recipe.rht_mask,
         )
 
 
@@ -943,6 +949,8 @@ def quantize_mxfp4_impl(
                     row_sr=scaling_recipe.use_sr,
                     col_sr=scaling_recipe_for_trans.use_sr,
                     scale_rounding_mode=scale_rounding_mode,
+                    row_rht_mask=scaling_recipe.rht_mask,
+                    col_rht_mask=scaling_recipe_for_trans.rht_mask,
                 )
             if x.ndim == 2 and dual_eligible(
                 x.shape[0], x.shape[1], scaling_recipe, scaling_recipe_for_trans
@@ -957,6 +965,8 @@ def quantize_mxfp4_impl(
                     row_sr=scaling_recipe.use_sr,
                     col_sr=scaling_recipe_for_trans.use_sr,
                     scale_rounding_mode=scale_rounding_mode,
+                    row_rht_mask=scaling_recipe.rht_mask,
+                    col_rht_mask=scaling_recipe_for_trans.rht_mask,
                 )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
@@ -973,6 +983,8 @@ def quantize_mxfp4_impl(
             scaling_recipe_for_trans.shuffle_scale,
             scaling_recipe_for_trans.shuffle_out,
             scale_rounding_mode,
+            scaling_recipe.rht_mask,
+            scaling_recipe_for_trans.rht_mask,
         )
     else:
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4(
@@ -986,6 +998,7 @@ def quantize_mxfp4_impl(
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
             scale_rounding_mode,
+            scaling_recipe.rht_mask,
         )
 
 

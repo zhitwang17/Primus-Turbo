@@ -743,6 +743,7 @@ def grouped_gemm_fp4_glu_impl(
         row_use_sr=row_sr,
         col_use_sr=col_sr,
         scale_rounding_mode=config.scale_rounding_mode,
+        rht_mask=out_col_scaling_recipe.rht_mask,
         out_dtype=out_dtype,
     )
     return intermediate, row_out, row_sc, col_out, col_sc
@@ -824,6 +825,7 @@ def grouped_gemm_fp4_dglu_impl(
         row_use_sr=row_sr,
         col_use_sr=col_sr,
         scale_rounding_mode=config.scale_rounding_mode,
+        rht_mask=out_col_scaling_recipe.rht_mask,
         out_dtype=out_dtype,
     )
     return torch.sum(grad_probs_partial, dim=0), row_out, row_sc, col_out, col_sc

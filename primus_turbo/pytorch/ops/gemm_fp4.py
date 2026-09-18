@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from dataclasses import replace
 from typing import Optional, Union
 
 import torch
@@ -122,6 +123,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_rht=True,
             shuffle_scale=preshuffle,
             shuffle_out=preshuffle,
+            rht_seed=config.rht_seed,
         )
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
@@ -211,7 +213,9 @@ class FP4GemmMXFunction(torch.autograd.Function):
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
-        ctx.config = config
+        # The config is mutable.  Snapshot it so changing a reused campaign
+        # config between forward and backward cannot mismatch the paired RHT.
+        ctx.config = replace(config)
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
 
@@ -242,6 +246,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             use_rht=True,
             shuffle_scale=preshuffle,
             shuffle_out=False,
+            rht_seed=ctx.config.rht_seed,
         )
 
         g_row, g_row_scale, g_col, g_col_scale = quantize_fp4_with_trans(

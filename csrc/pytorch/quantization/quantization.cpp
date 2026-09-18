@@ -19,6 +19,12 @@ static inline int64_t cdiv(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
+static inline uint32_t checked_rht_mask(const int64_t mask, const char *name) {
+    PRIMUS_TURBO_CHECK(mask >= 0 && mask <= 0xffffffffLL, name,
+                       " must be in [0, 0xffffffff]. But got ", mask);
+    return static_cast<uint32_t>(mask);
+}
+
 // TODO: Check correctness
 float get_float8_max(const at::ScalarType dtype) {
     switch (dtype) {
@@ -547,9 +553,14 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
     const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
     const bool shuffle_rowwise_scale, const bool shuffle_rowwise, const bool shuffle_colwise_scale,
-    const bool shuffle_colwise, const int64_t scale_rounding_mode) {
+    const bool shuffle_colwise, const int64_t scale_rounding_mode, const int64_t rowwise_rht_mask,
+    const int64_t colwise_rht_mask) {
     using namespace primus_turbo::detail;
     (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
+    const uint32_t checked_rowwise_rht_mask =
+        checked_rht_mask(rowwise_rht_mask, "rowwise_rht_mask");
+    const uint32_t checked_colwise_rht_mask =
+        checked_rht_mask(colwise_rht_mask, "colwise_rht_mask");
 
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
@@ -647,9 +658,9 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
             colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
             colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
             ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht,
-                          shuffle_rowwise_scale, shuffle_rowwise),
+                          shuffle_rowwise_scale, shuffle_rowwise, checked_rowwise_rht_mask),
             ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht,
-                          shuffle_colwise_scale, shuffle_colwise),
+                          shuffle_colwise_scale, shuffle_colwise, checked_colwise_rht_mask),
             static_cast<int>(scale_rounding_mode), stream);
     });
 
@@ -671,9 +682,11 @@ std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarT
                                        const int64_t axis, const int64_t padding_align_size,
                                        const bool use_2d_block, const bool use_sr,
                                        const bool use_rht, const bool shuffle_scale,
-                                       const bool shuffle_out, const int64_t scale_rounding_mode) {
+                                       const bool shuffle_out, const int64_t scale_rounding_mode,
+                                       const int64_t rht_mask) {
     using namespace primus_turbo::detail;
     (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
+    const uint32_t checked_mask = checked_rht_mask(rht_mask, "rht_mask");
 
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
@@ -757,7 +770,7 @@ std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarT
             reinterpret_cast<dtype::float4x2_e2m1 *>(output.data_ptr()),
             scale_tensor.data_ptr<uint8_t>(), mode, G, M, N, M_pad, N_pad, scale_stride, scale_N,
             scale_M_pad, scale_N_pad,
-            ScalingRecipe(use_2d_block, use_sr, use_rht, shuffle_scale, shuffle_out),
+            ScalingRecipe(use_2d_block, use_sr, use_rht, shuffle_scale, shuffle_out, checked_mask),
             static_cast<int>(scale_rounding_mode), stream);
     });
 
@@ -1246,9 +1259,14 @@ std::vector<at::Tensor> grouped_quantize_mxfp4_dual(
     const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
     const at::ScalarType dest_dtype, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
     const bool rowwise_use_rht, const bool colwise_use_2d_block, const bool colwise_use_sr,
-    const bool colwise_use_rht, const int64_t scale_rounding_mode) {
+    const bool colwise_use_rht, const int64_t scale_rounding_mode, const int64_t rowwise_rht_mask,
+    const int64_t colwise_rht_mask) {
     using namespace primus_turbo::detail;
     (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
+    const uint32_t checked_rowwise_rht_mask =
+        checked_rht_mask(rowwise_rht_mask, "rowwise_rht_mask");
+    const uint32_t checked_colwise_rht_mask =
+        checked_rht_mask(colwise_rht_mask, "colwise_rht_mask");
 
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
@@ -1320,8 +1338,10 @@ std::vector<at::Tensor> grouped_quantize_mxfp4_dual(
             static_cast<int>(N_pad), static_cast<int>(rowwise_scale_stride),
             static_cast<int>(colwise_scale_stride), static_cast<int>(rowwise_scale_N),
             static_cast<int>(colwise_scale_N),
-            ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht, false, false),
-            ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht, false, false),
+            ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht, false, false,
+                          checked_rowwise_rht_mask),
+            ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht, false, false,
+                          checked_colwise_rht_mask),
             static_cast<int>(scale_rounding_mode), stream);
     });
 
@@ -1332,14 +1352,13 @@ std::vector<at::Tensor> grouped_quantize_mxfp4_dual(
 }
 
 // Single-direction (rowwise OR colwise) grouped MXFP4 quant for grouped GEMM.
-std::vector<at::Tensor> grouped_quantize_mxfp4(const at::Tensor input, const at::Tensor group_lens,
-                                               const at::Tensor     group_offs,
-                                               const at::ScalarType dest_dtype, const int64_t axis,
-                                               const bool use_2d_block, const bool use_sr,
-                                               const bool    use_rht,
-                                               const int64_t scale_rounding_mode) {
+std::vector<at::Tensor> grouped_quantize_mxfp4(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const int64_t axis, const bool use_2d_block, const bool use_sr,
+    const bool use_rht, const int64_t scale_rounding_mode, const int64_t rht_mask) {
     using namespace primus_turbo::detail;
     (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
+    const uint32_t checked_mask = checked_rht_mask(rht_mask, "rht_mask");
 
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
@@ -1403,7 +1422,8 @@ std::vector<at::Tensor> grouped_quantize_mxfp4(const at::Tensor input, const at:
             group_offs.data_ptr<int64_t>(), group_offs_padded_colwise.data_ptr<int64_t>(), mode,
             static_cast<int>(G), static_cast<int>(total_M), static_cast<int>(N),
             static_cast<int>(M_pad_col), static_cast<int>(N_pad), static_cast<int>(scale_stride),
-            static_cast<int>(scale_N), ScalingRecipe(use_2d_block, use_sr, use_rht, false, false),
+            static_cast<int>(scale_N),
+            ScalingRecipe(use_2d_block, use_sr, use_rht, false, false, checked_mask),
             static_cast<int>(scale_rounding_mode), stream);
     });
 

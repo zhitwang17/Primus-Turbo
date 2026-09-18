@@ -275,6 +275,7 @@ def _build_grouped_mxfp4_nt_kernel(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    epi_rht_mask=0,
     activation="silu",  # the GLU gate; see SUPPORTED_ACTIVATIONS
     clamp_limit=None,  # clamp bound; see _glu_clamp
     epi_scale_rounding_bias=1 << 21,
@@ -369,6 +370,8 @@ def _build_grouped_mxfp4_nt_kernel(
     assert not (epi_row_sr or epi_col_sr) or glu_act_quant or dglu_act_quant, (
         "stochastic rounding needs one of the quantising epilogues"
     )
+    assert isinstance(epi_rht_mask, int) and 0 <= epi_rht_mask <= 0xFFFFFFFF
+    assert not epi_rht_mask or glu_act_quant or dglu_act_quant
 
     # parity-split LDS ring: skewed rows (odd 64-multiple stride) straddle two 128B lines
     _A_SLOT = (BLOCK_M // 2) * LDS_ROW_STRIDE  # skewed rows need 3 slots, aligned rows 2
@@ -638,6 +641,7 @@ def _build_grouped_mxfp4_nt_kernel(
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=SR_SEED,
+                    rht_mask=epi_rht_mask,
                 )
                 assert 4 * LDS_WORDS_PER_WAVE * 4 <= (NBB + _NOBUF) * _B_SLOT
                 store_c = StoreCSwiGLUQuant(*_glu_args, quant_store=_q, **_glu_kw)
@@ -695,6 +699,7 @@ def _build_grouped_mxfp4_nt_kernel(
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=SR_SEED,
+                    rht_mask=epi_rht_mask,
                 )
                 store_c = StoreCdSwiGLUQuadQuant(*_dglu_args, quant_store=_q, **_dglu_kw)
                 pad_row_base = _lane_tbl_get(_pad0, group_idx) + bm * I32(BLOCK_M) + I32(wave_m_off)
@@ -1012,6 +1017,7 @@ def _compile_grouped_mxfp4_nt_glu(
     dglu_epi_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    epi_rht_mask=0,
     activation="silu",
     clamp_limit=None,
     epi_scale_rounding_bias=1 << 21,
@@ -1051,6 +1057,7 @@ def _compile_grouped_mxfp4_nt_glu(
         dglu_act_quant=dglu_epi_quant,
         epi_row_sr=epi_row_sr,
         epi_col_sr=epi_col_sr,
+        epi_rht_mask=epi_rht_mask,
         activation=activation,
         clamp_limit=clamp_limit,
         epi_scale_rounding_bias=epi_scale_rounding_bias,
@@ -1075,6 +1082,7 @@ def _compile_grouped_mxfp4_nt_glu(
             False,
             True,
             is_fp16=out_fp16,
+            col_rht_mask=epi_rht_mask,
         )
 
     if dglu_epi_quant:

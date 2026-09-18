@@ -23,6 +23,26 @@ except ImportError:  # pragma: no cover - depends on the installed torch
 __all__ = ["float8_e4m3", "float8_e5m2"]
 
 
+def rht_mask_from_seed(seed: int) -> int:
+    """Map a campaign seed to the static 32-bit Rademacher mask used by H16x2.
+
+    Seed zero preserves the legacy deterministic Hadamard transform. A non-zero
+    seed is mixed on the host so HIP and FlyDSL receive the same mask verbatim.
+    """
+    seed = int(seed)
+    if not 0 <= seed <= 0xFFFFFFFF:
+        raise ValueError(f"rht_seed must be in [0, 2**32 - 1], got {seed}")
+    if seed == 0:
+        return 0
+    value = seed
+    value ^= value >> 16
+    value = (value * 0x85EBCA6B) & 0xFFFFFFFF
+    value ^= value >> 13
+    value = (value * 0xC2B2AE35) & 0xFFFFFFFF
+    value ^= value >> 16
+    return value or 0xA5A55A5A
+
+
 def is_fp8_dtype(dtype):
     TORCH_FP8_DTYPE = [
         torch.float8_e4m3fn,
@@ -157,6 +177,7 @@ class _ScalingRecipeFields(NamedTuple):
     - use_2d_block: Whether to use 2D block in quantization. Available in blockwise, MXFP8 and MXFP4.
     - use_sr: Whether to use stochastic rounding in quantization. Available in MXFP4.
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
+    - rht_seed: Static randomized-RHT campaign seed. Zero preserves the fixed H16x2.
     - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.
     - shuffle_output: Whether to shuffle the output tensor. Available in MXFP4.
     """
@@ -169,6 +190,8 @@ class _ScalingRecipeFields(NamedTuple):
     shuffle_scale: bool = False
     shuffle_out: bool = False
 
+    rht_seed: int = 0
+
 
 class ScalingRecipe(_ScalingRecipeFields, metaclass=_OpaqueMeta):
     """See :class:`_ScalingRecipeFields` for the fields.
@@ -177,8 +200,28 @@ class ScalingRecipe(_ScalingRecipeFields, metaclass=_OpaqueMeta):
     is a metaclass conflict at class creation.
     """
 
+    def __new__(
+        cls,
+        use_2d_block: bool = False,
+        use_sr: bool = False,
+        use_rht: bool = False,
+        shuffle_scale: bool = False,
+        shuffle_out: bool = False,
+        rht_seed: int = 0,
+    ):
+        # Validate even when RHT is disabled so ScalingRecipe and
+        # Float4QuantConfig expose one consistent seed contract.
+        rht_mask_from_seed(rht_seed)
+        return _ScalingRecipeFields.__new__(
+            cls, use_2d_block, use_sr, use_rht, shuffle_scale, shuffle_out, rht_seed
+        )
+
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
+
+    @property
+    def rht_mask(self) -> int:
+        return rht_mask_from_seed(self.rht_seed) if self.use_rht else 0
 
 
 def _quant_config_fx_repr(config) -> Tuple[str, dict]:
@@ -257,6 +300,8 @@ class Float4QuantConfig(metaclass=_OpaqueMeta):
     # Reference: Jianlin Yu et al., "MXAttention", arXiv:2607.24377.
     # https://arxiv.org/abs/2607.24377
     scale_rounding_mode: int = 0
+    # Static randomized-RHT campaign seed. Zero keeps the legacy deterministic H16x2.
+    rht_seed: int = 0
 
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
@@ -272,6 +317,7 @@ class Float4QuantConfig(metaclass=_OpaqueMeta):
         )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
         assert self.scale_rounding_mode in (0, 1, 2), "scale_rounding_mode must be 0, 1, or 2"
+        rht_mask_from_seed(self.rht_seed)
 
         mx_support_scale_dtype = ScaleDtype.E8M0
         assert self.scale_dtype == mx_support_scale_dtype, (
@@ -280,6 +326,10 @@ class Float4QuantConfig(metaclass=_OpaqueMeta):
 
     def mxfp4_scaling(self) -> bool:
         return self.granularity == ScalingGranularity.MX_BLOCKWISE and self.scale_dtype == ScaleDtype.E8M0
+
+    @property
+    def rht_mask(self) -> int:
+        return rht_mask_from_seed(self.rht_seed)
 
 
 # Lets a config travel through a torch.library custom op as a single argument rather

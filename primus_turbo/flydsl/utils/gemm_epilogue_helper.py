@@ -156,6 +156,29 @@ def _rht16_unscaled(v):
     return r
 
 
+def _apply_rht_signs(bits, rht_mask, bit0=0):
+    """Apply a compile-time Rademacher sign mask to f32 bit patterns.
+
+    ``bits`` is one contiguous slice of the logical 32-value MX block and
+    ``bit0`` names its first bit in ``rht_mask``.  Keeping the mask as a Python
+    integer makes the zero-mask path exactly the historical fixed-Hadamard path;
+    nonzero masks emit one XOR only for the selected values, before either H16.
+    """
+    assert isinstance(rht_mask, int), "rht_mask must be a compile-time Python int"
+    assert 0 <= rht_mask <= 0xFFFFFFFF, f"rht_mask must fit uint32, got {rht_mask}"
+    if rht_mask == 0:
+        return bits
+    sign_bit = fx.Int32(-(1 << 31))
+    zero = fx.Int32(0)
+    out = []
+    for i in range_constexpr(len(bits)):
+        value = bits[i]
+        if rht_mask & (1 << (bit0 + i)):
+            value = arith.select((value & 0x7FFFFFFF) == zero, value, value ^ sign_bit)
+        out.append(value)
+    return out
+
+
 def _quad_max_i32(v):
     """Max an i32 across each group of four lanes; all four end with the total.
 
@@ -255,12 +278,14 @@ class MXFP4DualQuantStore:
         row_sr=False,
         col_sr=False,
         sr_seed=None,
+        rht_mask=0,
     ):
         self.n_cols = n_cols
         self.scale_rounding_bias = fx.Int32(scale_rounding_bias)
         self.row_sr = row_sr
         self.col_sr = col_sr
         self.sr_seed = fx.Int32(0) if sr_seed is None else sr_seed
+        self.rht_mask = rht_mask
         self.lane_id = lane_id
 
         # i32-word widths: 8 fp4 per word, one E8M0 byte per 32 values. The col-wise
@@ -329,6 +354,7 @@ class MXFP4DualQuantStore:
             )
             for r in range_constexpr(BAND_ROWS)
         ]
+        bits = _apply_rht_signs(bits, self.rht_mask)
         vf = [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits]
         vf = _rht16_unscaled(vf[0:16]) + _rht16_unscaled(vf[16:32])
         native, biased = _scale_from_amax(_amax_i32(vf), self.scale_rounding_bias, log2_extra=2)
@@ -441,6 +467,7 @@ class MXFP4DualQuantStoreDglu:
         row_sr=False,
         col_sr=False,
         sr_seed=None,
+        rht_mask=0,
     ):
         assert (DGLU_BAND_ROWS // 2) * DGLU_COL_BAND <= DGLU_BAND_ROWS * row_stride, (
             f"the col-wise staging ({(DGLU_BAND_ROWS // 2) * DGLU_COL_BAND} words) has to fit the "
@@ -452,6 +479,7 @@ class MXFP4DualQuantStoreDglu:
         self.row_sr = row_sr
         self.col_sr = col_sr
         self.sr_seed = fx.Int32(0) if sr_seed is None else sr_seed
+        self.rht_mask = rht_mask
         self.lane_id = lane_id
         self.wave_n = wave_n
         self.group_words = group_words
@@ -587,6 +615,7 @@ class MXFP4DualQuantStoreDglu:
             w = self._lds_read1(self._col_word(half * (DGLU_HALF_ROWS // 2) + rp, bcol))
             bits.append(w << 16)
             bits.append(w & 0xFFFF0000)
+        bits = _apply_rht_signs(bits, self.rht_mask, half * DGLU_HALF_ROWS)
         vf = _rht16_unscaled([Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits])
         return vf, _amax_i32(vf)
 
